@@ -1,0 +1,14 @@
+.git
+.venv
+__pycache__
+*.pyc
+.mypy_cache
+.pytest_cache
+data/
+models/
+outputs/
+runpod_artifacts/
+gradio_outputs/
+api_smoke.wav
+*.wav
+*.mp3

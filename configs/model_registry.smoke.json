@@ -1,0 +1,189 @@
+{
+  "default_model_id": "hiyoko_tentyuou",
+  "models": [
+    {
+      "id": "hiyoko_tentyuou",
+      "checkpoint": "../outputs/irodori_loras/hiyoko_tentyuou/hiyoko_tentyuou_merged.safetensors",
+      "ref_wav": "../data/distilled/hiyoko_tentyuou/raw/hiyoko_tentyuou_000001.wav",
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA distilled from SBV2"
+    },
+    {
+      "id": "nana02",
+      "checkpoint": "../outputs/irodori_loras/nana02/nana02_merged.safetensors",
+      "ref_wav": "../data/distilled/nana02/raw/nana02_000001.wav",
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA distilled from SBV2"
+    },
+    {
+      "id": "sakura04",
+      "checkpoint": "../outputs/irodori_loras/sakura04/sakura04_merged.safetensors",
+      "ref_wav": "../data/distilled/sakura04/raw/sakura04_000001.wav",
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA distilled from SBV2"
+    },
+    {
+      "id": "shiori02",
+      "checkpoint": "../outputs/irodori_loras/shiori02/shiori02_merged.safetensors",
+      "ref_wav": "../data/distilled/shiori02/raw/shiori02_000001.wav",
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA distilled from SBV2"
+    },
+    {
+      "id": "noa01",
+      "checkpoint": "../outputs/irodori_loras/noa01/noa01_merged.safetensors",
+      "ref_wav": "../data/distilled/noa01/raw/noa01_000001.wav",
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA distilled from SBV2"
+    },
+    {
+      "id": "amane04",
+      "checkpoint": "../outputs/irodori_loras/amane04/amane04_merged.safetensors",
+      "ref_wav": "../data/distilled/amane04/raw/amane04_000001.wav",
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA distilled from SBV2"
+    },
+    {
+      "id": "momo02",
+      "checkpoint": "../outputs/irodori_loras/momo02/momo02_merged.safetensors",
+      "ref_wav": "../data/distilled/momo02/raw/momo02_000001.wav",
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA distilled from SBV2"
+    },
+    {
+      "id": "fururu02",
+      "checkpoint": "../outputs/irodori_loras/fururu02/fururu02_merged.safetensors",
+      "ref_wav": "../data/distilled/fururu02/raw/fururu02_000001.wav",
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA distilled from SBV2"
+    },
+    {
+      "id": "chacha02",
+      "checkpoint": "../outputs/irodori_loras/chacha02/chacha02_merged.safetensors",
+      "ref_wav": "../data/distilled/chacha02/raw/chacha02_000001.wav",
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA distilled from SBV2"
+    },
+    {
+      "id": "suzuha001",
+      "checkpoint": "../outputs/irodori_loras/suzuha001/suzuha001_merged.safetensors",
+      "ref_wav": "../../../../sbv2/Style-Bert-VITS2/Data/suzuha001/raw/SUZUHA_fx-0.wav",
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA trained from recorded dataset"
+    },
+    {
+      "id": "shinon002",
+      "checkpoint": "../outputs/irodori_loras/shinon002/shinon002_merged.safetensors",
+      "ref_wav": "../data/distilled/shinon002/raw/shinon002_000001.wav",
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA distilled from SBV2"
+    },
+    {
+      "id": "saki003",
+      "checkpoint": "../outputs/irodori_loras/saki003/saki003_merged.safetensors",
+      "ref_wav": "../data/distilled/saki003/raw/saki003_000001.wav",
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA distilled from SBV2"
+    },
+    {
+      "id": "ruri01",
+      "checkpoint": "../outputs/irodori_loras/ruri01/ruri01_merged.safetensors",
+      "ref_wav": "../data/distilled/ruri01/raw/ruri01_000001.wav",
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA distilled from SBV2"
+    },
+    {
+      "id": "wanko002",
+      "checkpoint": "../outputs/irodori_loras/wanko002/wanko002_merged.safetensors",
+      "ref_wav": "../data/distilled/wanko002/raw/wanko002_000001.wav",
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA distilled from SBV2"
+    },
+    {
+      "id": "nephil003",
+      "checkpoint": "../outputs/irodori_loras/nephil003/nephil003_merged.safetensors",
+      "ref_wav": "../data/distilled/nephil003/raw/nephil003_000001.wav",
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA distilled from SBV2"
+    },
+    {
+      "id": "mao005",
+      "checkpoint": "../outputs/irodori_loras/mao005/mao005_merged.safetensors",
+      "ref_wav": "../../../../sbv2/Style-Bert-VITS2/Data/mao005_ml/raw/Sweet/MAO_fx-100.wav",
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA trained from recorded dataset"
+    },
+    {
+      "id": "kohaku004",
+      "checkpoint": "../outputs/irodori_loras/kohaku004/kohaku004_merged.safetensors",
+      "ref_wav": "../../../../sbv2/Style-Bert-VITS2/Data/kohaku004_ml/raw/000A.wav",
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA trained from recorded dataset"
+    },
+    {
+      "id": "hachiroku_20251208_marged",
+      "checkpoint": "../outputs/irodori_loras/hachiroku_20251208_marged/hachiroku_20251208_marged_merged.safetensors",
+      "ref_wav": "../../../../sbv2/Style-Bert-VITS2/Data/hachiroku_20251208/raw/001.wav",
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA trained from recorded dataset"
+    },
+    {
+      "id": "hachiroku_20251208_ml",
+      "checkpoint": "../outputs/irodori_loras/hachiroku_20251208_ml/hachiroku_20251208_ml_merged.safetensors",
+      "ref_wav": "../../../../sbv2/Style-Bert-VITS2/Data/hachiroku_20251208_ml/raw/001.wav",
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA trained from recorded dataset"
+    },
+    {
+      "id": "sora003",
+      "checkpoint": "../outputs/irodori_loras/sora003/sora003_merged.safetensors",
+      "ref_wav": "../data/distilled/sora003/raw/sora003_000001.wav",
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA distilled from SBV2"
+    },
+    {
+      "id": "alisa002",
+      "checkpoint": "../outputs/irodori_loras/alisa002/alisa002_merged.safetensors",
+      "ref_wav": "../data/distilled/alisa002/raw/alisa002_000001.wav",
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA distilled from SBV2"
+    },
+    {
+      "id": "setsuho008",
+      "checkpoint": "../outputs/irodori_loras/setsuho008/setsuho008_merged.safetensors",
+      "ref_wav": "../data/distilled/setsuho008/raw/setsuho008_000001.wav",
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA distilled from SBV2"
+    },
+    {
+      "id": "toa002",
+      "checkpoint": "../outputs/irodori_loras/toa002/toa002_merged.safetensors",
+      "ref_wav": "../data/distilled/toa002/raw/toa002_000001.wav",
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA distilled from SBV2"
+    }
+  ]
+}

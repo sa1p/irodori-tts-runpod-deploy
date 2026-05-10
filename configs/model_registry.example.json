@@ -1,0 +1,21 @@
+{
+  "default_model_id": "kohaku",
+  "models": [
+    {
+      "id": "kohaku",
+      "checkpoint": "../outputs/kohaku_lora/kohaku_lora_merged.safetensors",
+      "ref_wav": "D:/sbv2/Style-Bert-VITS2/Data/kohaku-haishin_v2/raw/haishin/kohaku-haishin-2.wav",
+      "enabled": true,
+      "preload": true,
+      "description": "Local Kohaku pilot LoRA"
+    },
+    {
+      "id": "hiyoko_tentyuou",
+      "checkpoint": "../outputs/irodori_loras/hiyoko_tentyuou/hiyoko_tentyuou_merged.safetensors",
+      "ref_wav": "../data/irodori_training/hiyoko_tentyuou/raw/hiyoko_tentyuou_000001.wav",
+      "enabled": false,
+      "preload": false,
+      "description": "Example entry generated after SBV2 distillation and Irodori LoRA FT"
+    }
+  ]
+}

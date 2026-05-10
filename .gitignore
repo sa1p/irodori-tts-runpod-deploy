@@ -157,6 +157,21 @@ ENV/
 env.bak/
 venv.bak/
 
+# Kohaku local fine-tuning artifacts
+data/kohaku/*.jsonl
+data/kohaku/latents/
+data/distilled/
+data/irodori_training/
+data/recorded_longform/
+models/
+outputs/
+logs/
+gradio_outputs/
+quality_checks/
+api_smoke.wav
+configs/model_registry.local.json
+runpod_artifacts/
+
 # Spyder project settings
 .spyderproject
 .spyproject

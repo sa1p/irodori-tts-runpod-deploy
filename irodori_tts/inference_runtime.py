@@ -17,7 +17,7 @@ from safetensors.torch import load_file as load_safetensors_file
 
 from .codec import DACVAECodec, patchify_latent, unpatchify_latent
 from .config import ModelConfig
-from .lora import checkpoint_state_uses_lora
+from .lora import checkpoint_state_uses_lora, is_lora_adapter_dir, load_lora_adapter
 from .model import TextToLatentRFDiT
 from .rf import sample_euler_rf_cfg
 from .text_normalization import normalize_text
@@ -152,6 +152,8 @@ def find_flattening_point(
 class RuntimeKey:
     checkpoint: str
     model_device: str
+    lora_adapter: str | None = None
+    lora_load_mode: str = "none"
     codec_repo: str = "Aratako/Semantic-DACVAE-Japanese-32dim"
     model_precision: str = "fp32"
     codec_device: str = "cpu"
@@ -161,6 +163,23 @@ class RuntimeKey:
     enable_watermark: bool = False
     compile_model: bool = False
     compile_dynamic: bool = False
+
+
+def _normalize_lora_load_mode(mode: str | None) -> str:
+    value = (mode or "none").strip().lower()
+    if value in {"", "none", "off", "disabled"}:
+        return "none"
+    if value in {"dynamic", "adapter"}:
+        return "dynamic"
+    if value in {"reload", "replace", "single", "single_adapter", "dynamic_reload"}:
+        return "reload"
+    if value in {"delta", "hot_swap", "hotswap", "manual", "manual_merge"}:
+        return "delta"
+    if value in {"merged", "merge", "merge_on_load"}:
+        return "merged"
+    raise ValueError(
+        f"Unsupported lora_load_mode={mode!r}. Expected one of: none, dynamic, reload, delta, merged."
+    )
 
 
 @dataclass
@@ -178,7 +197,7 @@ class SamplingRequest:
     max_ref_seconds: float | None = 30.0
     max_text_len: int | None = None
     max_caption_len: int | None = None
-    num_steps: int = 40
+    num_steps: int = 6
     cfg_scale_text: float = 3.0
     cfg_scale_caption: float = 3.0
     cfg_scale_speaker: float = 5.0
@@ -194,6 +213,8 @@ class SamplingRequest:
     speaker_kv_min_t: float | None = None
     speaker_kv_max_layers: int | None = None
     seed: int | None = None
+    t_schedule_mode: str = "sway"
+    sway_coeff: float = -1.0
     trim_tail: bool = True
     tail_window_size: int = 20
     tail_std_threshold: float = 0.05
@@ -209,6 +230,55 @@ class SamplingResult:
     total_to_decode: float
     used_seed: int
     messages: list[str]
+
+
+@dataclass(frozen=True)
+class _LoraDeltaAdapter:
+    path: str
+    scaling: float
+    weights: dict[str, tuple[torch.Tensor, torch.Tensor]]
+
+
+def _load_lora_delta_adapter(adapter_dir: Path) -> _LoraDeltaAdapter:
+    config_path = adapter_dir / "adapter_config.json"
+    raw_config = json.loads(config_path.read_text(encoding="utf-8"))
+    if bool(raw_config.get("fan_in_fan_out", False)):
+        raise ValueError(f"LoRA delta switching does not support fan_in_fan_out=True: {adapter_dir}")
+    r = int(raw_config["r"])
+    if r <= 0:
+        raise ValueError(f"LoRA rank must be positive: {adapter_dir}")
+    scaling = float(raw_config["lora_alpha"]) / float(r)
+
+    state_path = adapter_dir / "adapter_model.safetensors"
+    if state_path.is_file():
+        state = load_safetensors_file(str(state_path), device="cpu")
+    else:
+        state_path = adapter_dir / "adapter_model.bin"
+        state = torch.load(state_path, map_location="cpu", weights_only=True)
+    if not isinstance(state, dict) or not state:
+        raise ValueError(f"LoRA adapter state is empty: {adapter_dir}")
+
+    grouped: dict[str, dict[str, torch.Tensor]] = {}
+    prefix = "base_model.model."
+    for raw_key, tensor in state.items():
+        key = str(raw_key)
+        if key.startswith(prefix):
+            key = key[len(prefix) :]
+        if key.endswith(".lora_A.weight"):
+            target = key[: -len(".lora_A.weight")]
+            grouped.setdefault(target, {})["A"] = tensor.detach().cpu()
+        elif key.endswith(".lora_B.weight"):
+            target = key[: -len(".lora_B.weight")]
+            grouped.setdefault(target, {})["B"] = tensor.detach().cpu()
+
+    weights: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    for target, pair in grouped.items():
+        if "A" not in pair or "B" not in pair:
+            raise ValueError(f"Incomplete LoRA A/B pair for {target!r}: {adapter_dir}")
+        weights[target] = (pair["A"], pair["B"])
+    if not weights:
+        raise ValueError(f"No LoRA delta weights found: {adapter_dir}")
+    return _LoraDeltaAdapter(path=str(adapter_dir.resolve()), scaling=scaling, weights=weights)
 
 
 def _maybe_compile_inference_model(
@@ -397,12 +467,13 @@ class InferenceRuntime:
         key: RuntimeKey,
         model_cfg: ModelConfig,
         train_cfg: dict | None,
-        model: TextToLatentRFDiT,
+        model: torch.nn.Module,
         tokenizer: PretrainedTextTokenizer,
         caption_tokenizer: PretrainedTextTokenizer | None,
         codec: DACVAECodec,
         default_text_max_len: int,
         default_caption_max_len: int,
+        model_dtype: torch.dtype,
     ) -> None:
         self.key = key
         self.model_device = resolve_runtime_device(key.model_device)
@@ -415,12 +486,122 @@ class InferenceRuntime:
         self.codec = codec
         self.default_text_max_len = default_text_max_len
         self.default_caption_max_len = default_caption_max_len
+        self.model_dtype = model_dtype
+        self._loaded_lora_adapters: set[str] = set()
+        self._active_lora_adapter: str | None = None
+        self._lora_delta_cache: dict[str, _LoraDeltaAdapter] = {}
+        self._active_lora_delta: _LoraDeltaAdapter | None = None
         self._infer_lock = threading.Lock()
+
+    def _clear_model_memory(self) -> None:
+        gc.collect()
+        if self.model_device.type == "cuda":
+            torch.cuda.empty_cache()
+        elif self.model_device.type == "mps":
+            mps = getattr(torch, "mps", None)
+            if mps is not None and hasattr(mps, "empty_cache"):
+                mps.empty_cache()
+
+    def _reload_base_model(self) -> None:
+        del self.model
+        self._clear_model_memory()
+
+        model_state, model_cfg_dict, train_cfg = _load_checkpoint_for_inference(
+            Path(self.key.checkpoint)
+        )
+        model_cfg = ModelConfig(**model_cfg_dict)
+        model = TextToLatentRFDiT(model_cfg).to(self.model_device)
+        model.load_state_dict(model_state)
+        del model_state
+        gc.collect()
+        model = model.to(dtype=self.model_dtype)
+        model.eval()
+
+        self.model_cfg = model_cfg
+        self.train_cfg = train_cfg if isinstance(train_cfg, dict) else None
+        self.model = _maybe_compile_inference_model(
+            model,
+            enabled=bool(self.key.compile_model),
+            dynamic=bool(self.key.compile_dynamic),
+        )
+        self._loaded_lora_adapters.clear()
+        self._active_lora_adapter = None
+        self._active_lora_delta = None
+        self._clear_model_memory()
+
+    def _get_lora_delta_adapter(self, adapter_dir: Path) -> _LoraDeltaAdapter:
+        key = str(adapter_dir.resolve())
+        adapter = self._lora_delta_cache.get(key)
+        if adapter is None:
+            adapter = _load_lora_delta_adapter(adapter_dir)
+            self._lora_delta_cache[key] = adapter
+        return adapter
+
+    def _apply_lora_delta_adapter(self, adapter: _LoraDeltaAdapter, *, sign: float) -> None:
+        with torch.no_grad():
+            for target, (weight_a, weight_b) in adapter.weights.items():
+                module = self.model.get_submodule(target)
+                if not isinstance(module, torch.nn.Linear):
+                    raise TypeError(
+                        f"LoRA delta target is not torch.nn.Linear: {target} ({type(module)!r})"
+                    )
+                if module.weight.ndim != 2:
+                    raise ValueError(f"LoRA delta target weight must be 2D: {target}")
+
+                weight_a_device = weight_a.to(
+                    device=module.weight.device,
+                    dtype=torch.float32,
+                    non_blocking=True,
+                )
+                weight_b_device = weight_b.to(
+                    device=module.weight.device,
+                    dtype=torch.float32,
+                    non_blocking=True,
+                )
+                delta = weight_b_device @ weight_a_device
+                if tuple(delta.shape) != tuple(module.weight.shape):
+                    raise ValueError(
+                        f"LoRA delta shape mismatch for {target}: "
+                        f"delta={tuple(delta.shape)} weight={tuple(module.weight.shape)}"
+                    )
+                delta.mul_(float(adapter.scaling) * float(sign))
+
+                updated = module.weight.data.float()
+                updated.add_(delta)
+                module.weight.data.copy_(updated.to(dtype=module.weight.dtype))
+
+    def ensure_lora_delta_adapter(self, *, adapter_name: str, adapter_path: str | Path) -> None:
+        adapter_dir = Path(adapter_path)
+        if not is_lora_adapter_dir(adapter_dir):
+            raise ValueError(f"LoRA adapter directory is invalid: {adapter_dir}")
+        if not adapter_name:
+            raise ValueError("adapter_name must not be empty.")
+
+        next_adapter = self._get_lora_delta_adapter(adapter_dir)
+        if self._active_lora_adapter == adapter_name and self._active_lora_delta == next_adapter:
+            return
+
+        if self._loaded_lora_adapters:
+            self._reload_base_model()
+
+        if self._active_lora_delta is not None:
+            self._apply_lora_delta_adapter(self._active_lora_delta, sign=-1.0)
+            self._active_lora_delta = None
+
+        self._apply_lora_delta_adapter(next_adapter, sign=1.0)
+        self._active_lora_delta = next_adapter
+        self._active_lora_adapter = adapter_name
+        self._clear_model_memory()
 
     @classmethod
     def from_key(cls, key: RuntimeKey) -> InferenceRuntime:
         model_device = resolve_runtime_device(key.model_device)
         codec_device = resolve_runtime_device(key.codec_device)
+        lora_load_mode = _normalize_lora_load_mode(key.lora_load_mode)
+        if lora_load_mode == "none" and key.lora_adapter is not None:
+            raise ValueError("RuntimeKey.lora_adapter requires lora_load_mode='merged' or 'dynamic'.")
+        if lora_load_mode in {"dynamic", "reload", "delta"} and key.lora_adapter is not None:
+            raise ValueError("Runtime-switched LoRA adapters must be loaded with ensure_lora_adapter().")
         model_dtype = resolve_runtime_dtype(
             precision=key.model_precision,
             device=model_device,
@@ -437,6 +618,23 @@ class InferenceRuntime:
 
         model = TextToLatentRFDiT(model_cfg).to(model_device)
         model.load_state_dict(model_state)
+        del model_state
+        gc.collect()
+        if lora_load_mode == "merged":
+            if key.lora_adapter is None:
+                raise ValueError("lora_load_mode='merged' requires RuntimeKey.lora_adapter.")
+            adapter_dir = Path(key.lora_adapter)
+            if not is_lora_adapter_dir(adapter_dir):
+                raise ValueError(f"LoRA adapter directory is invalid: {adapter_dir}")
+            model = load_lora_adapter(
+                model,
+                adapter_dir,
+                is_trainable=False,
+                adapter_name="merged",
+            )
+            if not hasattr(model, "merge_and_unload"):
+                raise RuntimeError("Loaded LoRA model does not support merge_and_unload().")
+            model = model.merge_and_unload()
         model = model.to(dtype=model_dtype)
         model.eval()
         model = _maybe_compile_inference_model(
@@ -504,7 +702,54 @@ class InferenceRuntime:
             codec=codec,
             default_text_max_len=default_text_max_len,
             default_caption_max_len=default_caption_max_len,
+            model_dtype=model_dtype,
         )
+
+    def ensure_lora_adapter(
+        self,
+        *,
+        adapter_name: str,
+        adapter_path: str | Path,
+        replace_existing: bool = False,
+    ) -> None:
+        adapter_dir = Path(adapter_path)
+        if not is_lora_adapter_dir(adapter_dir):
+            raise ValueError(f"LoRA adapter directory is invalid: {adapter_dir}")
+        if not adapter_name:
+            raise ValueError("adapter_name must not be empty.")
+
+        if (
+            replace_existing
+            and self._loaded_lora_adapters
+            and self._active_lora_adapter != adapter_name
+        ):
+            self._reload_base_model()
+
+        if adapter_name not in self._loaded_lora_adapters:
+            if not self._loaded_lora_adapters:
+                self.model = load_lora_adapter(
+                    self.model,
+                    adapter_dir,
+                    is_trainable=False,
+                    adapter_name=adapter_name,
+                )
+            else:
+                if not hasattr(self.model, "load_adapter"):
+                    raise RuntimeError("Current model does not support multiple LoRA adapters.")
+                self.model.load_adapter(
+                    str(adapter_dir),
+                    adapter_name=adapter_name,
+                    is_trainable=False,
+                )
+            self.model = self.model.to(device=self.model_device, dtype=self.model_dtype)
+            self.model.eval()
+            self._loaded_lora_adapters.add(adapter_name)
+
+        if self._active_lora_adapter != adapter_name:
+            if not hasattr(self.model, "set_adapter"):
+                raise RuntimeError("Current model does not support LoRA adapter switching.")
+            self.model.set_adapter(adapter_name)
+            self._active_lora_adapter = adapter_name
 
     def _load_reference_latent(
         self,
@@ -587,7 +832,8 @@ class InferenceRuntime:
             ref_latent = ref_latent[:, :max_ref_latent_steps]
 
         ref_latent_patched = patchify_latent(ref_latent, self.model_cfg.latent_patch_size).to(
-            self.model_device
+            device=self.model_device,
+            dtype=runtime_dtype,
         )
         if ref_latent_patched.shape[1] == 0:
             raise ValueError(
@@ -615,7 +861,8 @@ class InferenceRuntime:
             (
                 "[runtime] start synthesize "
                 "model_device={} model_precision={} codec_device={} codec_precision={} "
-                "watermark={} mode={} seconds={} steps={} seed={} candidates={} decode_mode={}"
+                "watermark={} mode={} seconds={} steps={} schedule={} sway_coeff={} "
+                "seed={} candidates={} decode_mode={}"
             ).format(
                 self.key.model_device,
                 self.key.model_precision,
@@ -625,6 +872,8 @@ class InferenceRuntime:
                 req.cfg_guidance_mode,
                 req.seconds,
                 req.num_steps,
+                req.t_schedule_mode,
+                req.sway_coeff,
                 "random" if req.seed is None else int(req.seed),
                 req.num_candidates,
                 req.decode_mode,
@@ -812,6 +1061,8 @@ class InferenceRuntime:
                 speaker_kv_scale=speaker_kv_scale,
                 speaker_kv_max_layers=speaker_kv_max_layers,
                 speaker_kv_min_t=speaker_kv_min_t,
+                t_schedule_mode=str(req.t_schedule_mode),
+                sway_coeff=float(req.sway_coeff),
             )
             stage_sec = _measure_end(self.model_device, t0)
             stage_timings.append(("sample_rf", stage_sec))
@@ -882,6 +1133,324 @@ class InferenceRuntime:
             used_seed=used_seed,
             messages=messages,
         )
+
+    def synthesize_batch(
+        self,
+        reqs: list[SamplingRequest],
+        *,
+        log_fn: Callable[[str], None] | None = None,
+    ) -> list[SamplingResult]:
+        if not reqs:
+            return []
+        if len(reqs) == 1:
+            return [self.synthesize(reqs[0], log_fn=log_fn)]
+
+        def _log(msg: str) -> None:
+            if log_fn is not None:
+                log_fn(msg)
+
+        req = reqs[0]
+        batch_size = len(reqs)
+        common_fields = (
+            "ref_wav",
+            "ref_latent",
+            "no_ref",
+            "ref_normalize_db",
+            "ref_ensure_max",
+            "decode_mode",
+            "seconds",
+            "max_ref_seconds",
+            "max_text_len",
+            "max_caption_len",
+            "num_steps",
+            "cfg_scale_text",
+            "cfg_scale_caption",
+            "cfg_scale_speaker",
+            "cfg_guidance_mode",
+            "cfg_scale",
+            "cfg_min_t",
+            "cfg_max_t",
+            "truncation_factor",
+            "rescale_k",
+            "rescale_sigma",
+            "context_kv_cache",
+            "speaker_kv_scale",
+            "speaker_kv_min_t",
+            "speaker_kv_max_layers",
+            "t_schedule_mode",
+            "sway_coeff",
+            "trim_tail",
+            "tail_window_size",
+            "tail_std_threshold",
+            "tail_mean_threshold",
+        )
+        for other in reqs[1:]:
+            for field in common_fields:
+                if getattr(other, field) != getattr(req, field):
+                    raise ValueError(f"Batch chunk requests must share {field}.")
+
+        messages: list[str] = []
+        if req.seconds <= 0:
+            raise ValueError(f"seconds must be > 0, got {req.seconds}")
+        decode_mode = str(req.decode_mode).strip().lower()
+        if decode_mode not in {"sequential", "batch"}:
+            raise ValueError(
+                f"Unsupported decode_mode={req.decode_mode!r}. Expected one of: sequential, batch."
+            )
+
+        normalized_texts = [normalize_text(str(item.text)).strip() for item in reqs]
+        if any(text == "" for text in normalized_texts):
+            raise ValueError("one or more batch texts became empty after normalization.")
+
+        text_max_len = (
+            self.default_text_max_len if req.max_text_len is None else int(req.max_text_len)
+        )
+        if text_max_len <= 0:
+            raise ValueError(f"max_text_len must be > 0, got {text_max_len}")
+        caption_max_len = (
+            self.default_caption_max_len
+            if req.max_caption_len is None
+            else int(req.max_caption_len)
+        )
+        if self.model_cfg.use_caption_condition and caption_max_len <= 0:
+            raise ValueError(f"max_caption_len must be > 0, got {caption_max_len}")
+
+        captions = ["" if item.caption is None else str(item.caption).strip() for item in reqs]
+        has_caption_text = bool(self.model_cfg.use_caption_condition and any(captions))
+
+        truncation_factor = None if req.truncation_factor is None else float(req.truncation_factor)
+        rescale_k = None if req.rescale_k is None else float(req.rescale_k)
+        rescale_sigma = None if req.rescale_sigma is None else float(req.rescale_sigma)
+        if truncation_factor is not None and truncation_factor <= 0:
+            raise ValueError(f"truncation_factor must be > 0, got {truncation_factor}")
+        if (rescale_k is None) != (rescale_sigma is None):
+            raise ValueError("rescale_k and rescale_sigma must be set together.")
+        if rescale_k is not None and rescale_k <= 0:
+            raise ValueError(f"rescale_k must be > 0, got {rescale_k}")
+        if rescale_sigma is not None and rescale_sigma <= 0:
+            raise ValueError(f"rescale_sigma must be > 0, got {rescale_sigma}")
+
+        speaker_kv_scale = None if req.speaker_kv_scale is None else float(req.speaker_kv_scale)
+        speaker_kv_min_t = None
+        speaker_kv_max_layers = (
+            None if req.speaker_kv_max_layers is None else int(req.speaker_kv_max_layers)
+        )
+        if speaker_kv_scale is not None:
+            if not self.model_cfg.use_speaker_condition:
+                messages.append(
+                    "info: speaker conditioning is disabled for this checkpoint; ignoring speaker_kv_scale."
+                )
+                speaker_kv_scale = None
+            else:
+                if speaker_kv_scale <= 0:
+                    raise ValueError(f"speaker_kv_scale must be > 0, got {speaker_kv_scale}")
+                speaker_kv_min_t = (
+                    0.9 if req.speaker_kv_min_t is None else float(req.speaker_kv_min_t)
+                )
+                if not (0.0 <= speaker_kv_min_t <= 1.0):
+                    raise ValueError(f"speaker_kv_min_t must be in [0, 1], got {speaker_kv_min_t}")
+                if speaker_kv_max_layers is not None and speaker_kv_max_layers < 0:
+                    raise ValueError(
+                        f"speaker_kv_max_layers must be >= 0 when specified, got {speaker_kv_max_layers}"
+                    )
+
+        cfg_mode = str(req.cfg_guidance_mode).strip().lower()
+        if cfg_mode not in {"independent", "joint", "alternating"}:
+            raise ValueError(
+                f"Unsupported cfg_guidance_mode={req.cfg_guidance_mode!r}. "
+                "Expected one of: independent, joint, alternating."
+            )
+
+        cfg_scale_text, cfg_scale_caption, cfg_scale_speaker, scale_messages = resolve_cfg_scales(
+            cfg_guidance_mode=cfg_mode,
+            cfg_scale_text=req.cfg_scale_text,
+            cfg_scale_caption=req.cfg_scale_caption,
+            cfg_scale_speaker=req.cfg_scale_speaker,
+            cfg_scale=req.cfg_scale,
+            use_caption_condition=has_caption_text,
+            use_speaker_condition=self.model_cfg.use_speaker_condition,
+        )
+        messages.extend(scale_messages)
+        for msg in scale_messages:
+            _log(msg)
+
+        used_seeds: list[int] = []
+        for item in reqs:
+            if item.seed is None:
+                used_seeds.append(int(secrets.randbits(63)))
+            else:
+                used_seeds.append(int(item.seed))
+
+        _log(
+            f"[runtime] start synthesize_batch "
+            f"model_device={self.key.model_device} model_precision={self.key.model_precision} "
+            f"codec_device={self.key.codec_device} codec_precision={self.key.codec_precision} "
+            f"watermark={self.codec.enable_watermark} mode={req.cfg_guidance_mode} "
+            f"seconds={req.seconds} steps={req.num_steps} schedule={req.t_schedule_mode} "
+            f"sway_coeff={req.sway_coeff} batch={batch_size} "
+            f"decode_mode={req.decode_mode}"
+        )
+
+        stage_timings: list[tuple[str, float]] = []
+        post_load_t0 = _measure_start(self.model_device, self.codec_device)
+
+        with self._infer_lock, torch.inference_mode():
+            t0 = _measure_start(self.model_device)
+            text_ids, text_mask = self.tokenizer.batch_encode(
+                normalized_texts,
+                max_length=text_max_len,
+            )
+            stage_sec = _measure_end(self.model_device, t0)
+            stage_timings.append(("tokenize_text", stage_sec))
+            _log(f"[runtime] batch tokenize_text: {stage_sec * 1000.0:.1f} ms")
+            text_ids = text_ids.to(self.model_device)
+            text_mask = text_mask.to(self.model_device)
+
+            caption_ids = None
+            caption_mask = None
+            if self.model_cfg.use_caption_condition:
+                if self.caption_tokenizer is None:
+                    raise RuntimeError(
+                        "Caption conditioning is enabled but caption tokenizer is not loaded."
+                    )
+                caption_ids, caption_mask = self.caption_tokenizer.batch_encode(
+                    captions,
+                    max_length=caption_max_len,
+                )
+                for index, caption_text in enumerate(captions):
+                    if caption_text == "":
+                        caption_mask[index].zero_()
+                caption_ids = caption_ids.to(self.model_device)
+                caption_mask = caption_mask.to(self.model_device)
+
+            target_samples = int(float(req.seconds) * self.codec.sample_rate)
+            latent_steps = math.ceil(target_samples / int(self.codec.model.hop_length))
+            patched_steps = math.ceil(latent_steps / self.model_cfg.latent_patch_size)
+
+            if isinstance(self.train_cfg, dict):
+                fixed_steps = self.train_cfg.get("fixed_target_latent_steps")
+                if isinstance(fixed_steps, int) and fixed_steps > 0 and latent_steps > fixed_steps:
+                    msg = (
+                        f"warning: requested latent length ({latent_steps}) exceeds fixed_target_latent_steps ({fixed_steps}) "
+                        "used in training. Long-tail stability may degrade."
+                    )
+                    messages.append(msg)
+                    _log(msg)
+
+            t0 = _measure_start(self.model_device, self.codec_device)
+            msg_count_before_ref = len(messages)
+            ref_latent, ref_mask = self._load_reference_latent(
+                req=req,
+                batch_size=batch_size,
+                messages=messages,
+            )
+            stage_sec = _measure_end(self.model_device, t0, self.codec_device)
+            stage_timings.append(("prepare_reference", stage_sec))
+            for msg in messages[msg_count_before_ref:]:
+                _log(msg)
+            _log(f"[runtime] batch prepare_reference: {stage_sec * 1000.0:.1f} ms")
+
+            t0 = _measure_start(self.model_device)
+            z_patched = sample_euler_rf_cfg(
+                model=self.model,
+                text_input_ids=text_ids,
+                text_mask=text_mask,
+                ref_latent=ref_latent,
+                ref_mask=ref_mask,
+                sequence_length=patched_steps,
+                caption_input_ids=caption_ids,
+                caption_mask=caption_mask,
+                num_steps=int(req.num_steps),
+                cfg_scale_text=cfg_scale_text,
+                cfg_scale_caption=cfg_scale_caption,
+                cfg_scale_speaker=cfg_scale_speaker,
+                cfg_guidance_mode=cfg_mode,
+                cfg_min_t=float(req.cfg_min_t),
+                cfg_max_t=float(req.cfg_max_t),
+                seed=used_seeds[0],
+                seeds=used_seeds,
+                truncation_factor=truncation_factor,
+                rescale_k=rescale_k,
+                rescale_sigma=rescale_sigma,
+                use_context_kv_cache=bool(req.context_kv_cache),
+                speaker_kv_scale=speaker_kv_scale,
+                speaker_kv_max_layers=speaker_kv_max_layers,
+                speaker_kv_min_t=speaker_kv_min_t,
+                t_schedule_mode=str(req.t_schedule_mode),
+                sway_coeff=float(req.sway_coeff),
+            )
+            stage_sec = _measure_end(self.model_device, t0)
+            stage_timings.append(("sample_rf", stage_sec))
+            _log(f"[runtime] batch sample_rf: {stage_sec * 1000.0:.1f} ms")
+
+            t0 = _measure_start(self.model_device)
+            z = unpatchify_latent(
+                z_patched,
+                patch_size=self.model_cfg.latent_patch_size,
+                latent_dim=self.model_cfg.latent_dim,
+            )
+            stage_sec = _measure_end(self.model_device, t0)
+            stage_timings.append(("unpatchify_latent", stage_sec))
+            _log(f"[runtime] batch unpatchify_latent: {stage_sec * 1000.0:.1f} ms")
+            z = z[:, :latent_steps]
+
+            t0 = _measure_start(self.model_device, self.codec_device)
+            trimmed_audios: list[torch.Tensor] = []
+            if decode_mode == "batch":
+                audio_batch = self.codec.decode_latent(z).cpu()
+                for i in range(batch_size):
+                    audio_i = audio_batch[i]
+                    max_samples = target_samples
+                    if bool(req.trim_tail):
+                        flattening_point = find_flattening_point(
+                            z[i],
+                            window_size=max(1, int(req.tail_window_size)),
+                            std_threshold=float(req.tail_std_threshold),
+                            mean_threshold=float(req.tail_mean_threshold),
+                        )
+                        flattening_samples = int(
+                            flattening_point * int(self.codec.model.hop_length)
+                        )
+                        if flattening_samples > 0:
+                            max_samples = min(max_samples, flattening_samples)
+                    trimmed_audios.append(audio_i[:, :max_samples])
+            else:
+                for i in range(batch_size):
+                    audio_i = self.codec.decode_latent(z[i : i + 1]).cpu()[0]
+                    max_samples = target_samples
+                    if bool(req.trim_tail):
+                        flattening_point = find_flattening_point(
+                            z[i],
+                            window_size=max(1, int(req.tail_window_size)),
+                            std_threshold=float(req.tail_std_threshold),
+                            mean_threshold=float(req.tail_mean_threshold),
+                        )
+                        flattening_samples = int(
+                            flattening_point * int(self.codec.model.hop_length)
+                        )
+                        if flattening_samples > 0:
+                            max_samples = min(max_samples, flattening_samples)
+                    trimmed_audios.append(audio_i[:, :max_samples])
+            stage_sec = _measure_end(self.model_device, t0, self.codec_device)
+            stage_timings.append(("decode_latent", stage_sec))
+            _log(f"[runtime] batch decode_latent ({decode_mode}): {stage_sec * 1000.0:.1f} ms")
+
+            total_to_decode = _measure_end(self.model_device, post_load_t0, self.codec_device)
+            _log(f"[runtime] batch total_to_decode: {total_to_decode:.3f} s")
+
+        _log("[runtime] done synthesize_batch")
+        return [
+            SamplingResult(
+                audio=trimmed_audios[index],
+                audios=[trimmed_audios[index]],
+                sample_rate=int(self.codec.sample_rate),
+                stage_timings=stage_timings,
+                total_to_decode=total_to_decode,
+                used_seed=used_seeds[index],
+                messages=messages,
+            )
+            for index in range(batch_size)
+        ]
 
     def unload(self) -> None:
         del self.model

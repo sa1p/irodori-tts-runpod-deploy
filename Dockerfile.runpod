@@ -1,0 +1,41 @@
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH="/root/.local/bin:${PATH}"
+ENV UV_LINK_MODE=copy
+ENV PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    ffmpeg \
+    git \
+    python3 \
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
+WORKDIR /app
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
+
+COPY . .
+RUN chmod +x /app/scripts/runpod_start.sh
+
+ENV HOST=0.0.0.0
+ENV PORT=8000
+ENV IRODORI_MODEL_DEVICE=cuda
+ENV IRODORI_MODEL_PRECISION=bf16
+ENV IRODORI_CODEC_DEVICE=cuda
+ENV IRODORI_CODEC_PRECISION=fp32
+ENV IRODORI_LORA_LOAD_MODE=delta
+ENV IRODORI_CHUNK_BATCH_SIZE=2
+ENV IRODORI_MAX_CACHED_RUNTIMES=1
+ENV IRODORI_PRELOAD_MODELS=false
+
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${PORT}/health" || exit 1
+
+CMD ["/app/scripts/runpod_start.sh"]

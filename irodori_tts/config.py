@@ -171,7 +171,7 @@ class TrainConfig:
 
 @dataclass
 class SamplingConfig:
-    num_steps: int = 40
+    num_steps: int = 6
     cfg_scale_text: float = 3.0
     cfg_scale_caption: float = 3.0
     cfg_scale_speaker: float = 5.0
@@ -186,6 +186,8 @@ class SamplingConfig:
     speaker_kv_scale: float | None = None
     speaker_kv_min_t: float | None = 0.9
     speaker_kv_max_layers: int | None = None
+    t_schedule_mode: str = "sway"
+    sway_coeff: float = -1.0
     # Deprecated: inference length is derived from --seconds and codec hop_length.
     sequence_length: int | None = None
     seed: int = 0

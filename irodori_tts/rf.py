@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import math
+from collections.abc import Sequence
+
 import torch
 
 from .model import TextToLatentRFDiT
@@ -124,7 +127,7 @@ def sample_euler_rf_cfg(
     sequence_length: int,
     caption_input_ids: torch.Tensor | None = None,
     caption_mask: torch.Tensor | None = None,
-    num_steps: int = 40,
+    num_steps: int = 6,
     cfg_scale_text: float = 3.0,
     cfg_scale_caption: float = 3.0,
     cfg_scale_speaker: float = 5.0,
@@ -132,6 +135,7 @@ def sample_euler_rf_cfg(
     cfg_min_t: float = 0.5,
     cfg_max_t: float = 1.0,
     seed: int = 0,
+    seeds: Sequence[int] | None = None,
     cfg_scale: float | None = None,
     truncation_factor: float | None = None,
     rescale_k: float | None = None,
@@ -140,6 +144,8 @@ def sample_euler_rf_cfg(
     speaker_kv_scale: float | None = None,
     speaker_kv_max_layers: int | None = None,
     speaker_kv_min_t: float | None = None,
+    t_schedule_mode: str = "sway",
+    sway_coeff: float = -1.0,
 ) -> torch.Tensor:
     """
     Euler sampling over RF ODE with text/reference/caption conditioning CFG.
@@ -152,12 +158,30 @@ def sample_euler_rf_cfg(
     batch_size = text_input_ids.shape[0]
     latent_dim = model.cfg.patched_latent_dim
 
-    rng, rng_device = _make_rng(seed=seed, device=device)
-    x_t = torch.randn(
-        (batch_size, sequence_length, latent_dim), device=rng_device, dtype=dtype, generator=rng
-    )
-    if rng_device != device:
-        x_t = x_t.to(device=device)
+    if seeds is None:
+        rng, rng_device = _make_rng(seed=seed, device=device)
+        x_t = torch.randn(
+            (batch_size, sequence_length, latent_dim), device=rng_device, dtype=dtype, generator=rng
+        )
+        if rng_device != device:
+            x_t = x_t.to(device=device)
+    else:
+        seed_values = [int(value) for value in seeds]
+        if len(seed_values) != batch_size:
+            raise ValueError(f"seeds length must match batch size: {len(seed_values)} != {batch_size}")
+        samples: list[torch.Tensor] = []
+        for seed_value in seed_values:
+            rng, rng_device = _make_rng(seed=seed_value, device=device)
+            sample = torch.randn(
+                (1, sequence_length, latent_dim),
+                device=rng_device,
+                dtype=dtype,
+                generator=rng,
+            )
+            if rng_device != device:
+                sample = sample.to(device=device)
+            samples.append(sample)
+        x_t = torch.cat(samples, dim=0)
     if truncation_factor is not None:
         x_t = x_t * float(truncation_factor)
 
@@ -178,7 +202,18 @@ def sample_euler_rf_cfg(
         )
 
     init_scale = 0.999
-    t_schedule = torch.linspace(1.0, 0.0, num_steps + 1, device=device) * init_scale
+    t_schedule_mode_norm = str(t_schedule_mode).strip().lower()
+    if t_schedule_mode_norm == "linear":
+        u = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
+    elif t_schedule_mode_norm == "sway":
+        u = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
+        u = u + float(sway_coeff) * (torch.cos(0.5 * math.pi * u) + u - 1.0)
+        u = u.clamp(0.0, 1.0)
+    else:
+        raise ValueError(
+            f"Unsupported t_schedule_mode={t_schedule_mode!r}. Expected 'linear' or 'sway'."
+        )
+    t_schedule = (1.0 - u) * init_scale
     use_independent_cfg = cfg_guidance_mode == "independent"
     use_joint_cfg = cfg_guidance_mode == "joint"
     use_alternating_cfg = cfg_guidance_mode == "alternating"

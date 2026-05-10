@@ -375,7 +375,7 @@ def build_ui() -> gr.Blocks:
 
         with gr.Accordion("Sampling", open=True):
             with gr.Row():
-                num_steps = gr.Slider(label="Num Steps", minimum=1, maximum=120, value=40, step=1)
+                num_steps = gr.Slider(label="Num Steps", minimum=1, maximum=120, value=6, step=1)
                 num_candidates = gr.Slider(
                     label="Num Candidates",
                     minimum=1,

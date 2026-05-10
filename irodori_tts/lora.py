@@ -207,9 +207,15 @@ def load_lora_adapter(
     adapter_path: str | Path,
     *,
     is_trainable: bool,
+    adapter_name: str = "default",
 ) -> torch.nn.Module:
     _, peft_model_cls, _ = _require_peft()
-    return peft_model_cls.from_pretrained(model, str(adapter_path), is_trainable=is_trainable)
+    return peft_model_cls.from_pretrained(
+        model,
+        str(adapter_path),
+        is_trainable=is_trainable,
+        adapter_name=adapter_name,
+    )
 
 
 def count_parameters(model: torch.nn.Module) -> tuple[int, int]:

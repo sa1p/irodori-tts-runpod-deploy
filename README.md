@@ -1,4 +1,255 @@
-# Irodori-TTS
+# Kohaku Irodori-TTS LoRA API
+
+This repository is a local fine-tuning/API wrapper around Irodori-TTS v2 for the
+Kohaku dataset at `D:\sbv2\Style-Bert-VITS2\Data\kohaku-haishin_v2`.
+
+## Multi-Model Production Shape
+
+The local API now supports multiple Irodori checkpoints through a registry file.
+Each model entry points to a merged Irodori `.safetensors` checkpoint and a fixed
+reference WAV. The runtime uses an LRU cache, so `IRODORI_MAX_CACHED_RUNTIMES=1`
+keeps VRAM low and reloads on model switches, while larger values trade VRAM for
+lower switch latency.
+
+```powershell
+$env:IRODORI_MODEL_REGISTRY = "configs/model_registry.example.json"
+$env:IRODORI_MAX_CACHED_RUNTIMES = "1"
+$env:IRODORI_PRELOAD_MODELS = "true"
+uv run uvicorn api_server:app --host 127.0.0.1 --port 8000
+```
+
+List models and generate audio:
+
+```powershell
+curl.exe http://127.0.0.1:8000/v1/models
+
+curl.exe -X POST http://127.0.0.1:8000/v1/tts `
+  -H "Content-Type: application/json" `
+  -d "{\"model_id\":\"kohaku\",\"text\":\"今日も来てくれてありがとう。\",\"format\":\"mp3\"}" `
+  --output api_smoke.mp3
+```
+
+For lowest latency in production, prefer one hot model per Pod when traffic is
+predictable. Use the multi-model cache for admin tools, low-QPS models, or a
+small set of frequently used voices that can fit in VRAM together.
+
+## Local Setup
+
+```powershell
+cd D:\github.com\Trippy-inc\irodori-tts-kohaku-api
+uv sync
+```
+
+## Prepare Data
+
+Convert the Style-Bert-VITS2 `esd.list` into JSONL for `datasets`.
+The initial run excludes `kohaku-haishin-60.wav` because it is 36.75 seconds.
+
+```powershell
+uv run python scripts\convert_esd_to_jsonl.py
+```
+
+Precompute DACVAE latents. This repository uses a local helper instead of
+upstream `prepare_manifest.py` because `datasets.Audio` can depend on
+`torchcodec` FFmpeg DLL loading on Windows.
+
+```powershell
+uv run python scripts\prepare_local_manifest.py `
+  --input-jsonl data/kohaku/train.jsonl `
+  --output-manifest data/kohaku/train_manifest.jsonl `
+  --latent-dir data/kohaku/latents `
+  --device cuda `
+  --target-sample-rate 48000
+```
+
+## Fine-Tune
+
+Download the v2 base checkpoint:
+
+```powershell
+uv run python scripts\download_base_model.py
+```
+
+Run LoRA fine-tuning:
+
+```powershell
+uv run python train.py `
+  --config configs/train_500m_v2_lora_kohaku.yaml `
+  --manifest data/kohaku/train_manifest.jsonl `
+  --output-dir outputs/kohaku_lora `
+  --init-checkpoint models/Irodori-TTS-500M-v2/model.safetensors `
+  --device cuda
+```
+
+Convert the final LoRA adapter to an inference checkpoint:
+
+```powershell
+uv run python convert_checkpoint_to_safetensors.py `
+  outputs/kohaku_lora/checkpoint_final `
+  --base-checkpoint models/Irodori-TTS-500M-v2/model.safetensors `
+  --output outputs/kohaku_lora/kohaku_lora_merged.safetensors
+```
+
+## Local API
+
+The API uses `kohaku-haishin-2.wav` as the default fixed reference voice.
+By default, API synthesis uses the fast production sampler:
+`num_steps=6`, `t_schedule_mode=sway`, `sway_coeff=-1.0`, and
+`trim_tail=true`.
+
+```powershell
+$env:IRODORI_CHECKPOINT = "outputs/kohaku_lora/kohaku_lora_merged.safetensors"
+$env:IRODORI_REF_WAV = "D:\sbv2\Style-Bert-VITS2\Data\kohaku-haishin_v2\raw\haishin\kohaku-haishin-2.wav"
+$env:IRODORI_MODEL_DEVICE = "cuda"
+$env:IRODORI_MODEL_PRECISION = "bf16"
+$env:IRODORI_CODEC_DEVICE = "cuda"
+$env:IRODORI_CODEC_PRECISION = "fp32"
+uv run uvicorn api_server:app --host 127.0.0.1 --port 8000
+```
+
+Generate WAV:
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8000/v1/tts `
+  -H "Content-Type: application/json" `
+  -d "{\"text\":\"今日も来てくれてありがとう。\"}" `
+  --output api_smoke.wav
+```
+
+Recommended MP3 streaming:
+
+```powershell
+curl.exe -N -X POST http://127.0.0.1:8000/v1/tts/stream `
+  -H "Content-Type: application/json" `
+  -d "{\"model_id\":\"kohaku004\",\"text\":\"今日も来てくれてありがとう。\",\"auto_split\":true,\"seconds\":60,\"max_chunk_chars\":100}" `
+  --output stream_smoke.mp3
+```
+
+`/v1/tts/stream` always returns `audio/mpeg`. The server keeps one ffmpeg
+encoder open per request, writes each generated chunk as raw PCM, and streams
+MP3 bytes as soon as the encoder emits them. This avoids concatenating separate
+MP3 files and keeps the output compatible with normal HTTP audio clients.
+
+## SBV2 Inventory And Distillation
+
+The target SBV2 model folder list is defined in `scripts/irodori_targets.py`.
+First inventory the 38 folders and detect which models already have recorded
+`esd.list` datasets:
+
+```powershell
+uv run python scripts\inventory_irodori_targets.py --pretty
+```
+
+Models without recorded datasets are treated as merged SBV2 teachers. Generate a
+distilled dataset by asking SBV2 to synthesize a neutral prompt set. The default
+layout expects the SBV2 source checkout at `C:\sbv2\Style-Bert-VITS2` and the
+model/data assets at `D:\sbv2\Style-Bert-VITS2`.
+
+```powershell
+uv run python scripts\distill_sbv2_dataset.py `
+  --models hiyoko_tentyuou,nana02 `
+  --mode subprocess `
+  --sbv2-root C:\sbv2\Style-Bert-VITS2 `
+  --sbv2-python C:\sbv2\Style-Bert-VITS2\venv\Scripts\python.exe `
+  --limit 160 `
+  --use-gpu
+```
+
+`subprocess` mode keeps SBV2 dependencies in the SBV2 venv instead of installing
+them into the Irodori uv environment. If an existing SBV2 API is already running,
+HTTP mode is also available:
+
+```powershell
+uv run python scripts\distill_sbv2_dataset.py `
+  --models hiyoko_tentyuou `
+  --mode http `
+  --http-url http://127.0.0.1:5000 `
+  --limit 160
+```
+
+Outputs are written under `data/distilled/<model_id>/` as `train.jsonl`,
+`esd.list`, and `raw/*.wav`.
+
+## Batch Irodori LoRA Training
+
+After inventory and any needed distillation, run the Irodori preparation,
+training, conversion, and registry generation pipeline. Use `--max-models` or
+`--models` for pilot runs before launching all 38.
+
+```powershell
+uv run python scripts\batch_train_irodori_loras.py `
+  --models kohaku004,hachiroku_20251208_ml `
+  --skip-existing `
+  --device cuda
+```
+
+For a short smoke run:
+
+```powershell
+uv run python scripts\batch_train_irodori_loras.py `
+  --models hiyoko_tentyuou `
+  --stages jsonl,manifest,train,convert,registry `
+  --max-steps 100 `
+  --skip-existing `
+  --device cuda
+```
+
+The generated API registry is `configs/model_registry.local.json`. Start the API
+with it:
+
+```powershell
+$env:IRODORI_MODEL_REGISTRY = "configs/model_registry.local.json"
+uv run uvicorn api_server:app --host 127.0.0.1 --port 8000
+```
+
+## Full Production Pipeline
+
+To run the whole local production pipeline for all configured models, use the
+PowerShell orchestrator. It inventories assets, distills SBV2-only voices through
+the SBV2 venv, prepares DACVAE latents, trains LoRA adapters, converts them to
+merged safetensors, writes `configs/model_registry.local.json`, and restarts the
+local API when complete.
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass `
+  -File scripts\run_full_production_pipeline.ps1 `
+  -DistillLimit 160 `
+  -MaxSteps 1000 `
+  -StartApiWhenDone
+```
+
+Check progress while it runs:
+
+```powershell
+uv run python scripts\pipeline_status.py `
+  --inventory logs\<run>\inventory.json `
+  --distill-target-rows 160
+```
+
+## RunPod Pod Deployment
+
+Build the image:
+
+```powershell
+docker build -f Dockerfile.runpod -t irodori-tts-api:runpod .
+```
+
+Recommended runtime layout:
+
+- Put merged checkpoints, registry JSON, and reference WAV files on a persistent
+  RunPod volume or sync them from object storage at boot.
+- Set `IRODORI_MODEL_REGISTRY` to the mounted registry path.
+- Keep `--workers 1`; the API already serializes GPU synthesis with a lock.
+- For failover, keep the same artifact bundle in object storage and run a second
+  Pod from the same image. A load balancer or client retry can switch to the
+  warm standby.
+- For high-QPS voices, deploy one Pod per voice and preload that single model.
+  For long-tail voices, a shared multi-model Pod with `IRODORI_MAX_CACHED_RUNTIMES=1`
+  is cheaper but has model switch latency.
+
+---
+
+# Upstream Irodori-TTS
 
 [![Model](https://img.shields.io/badge/Model-HuggingFace-yellow)](https://huggingface.co/Aratako/Irodori-TTS-500M-v2)
 [![VoiceDesign](https://img.shields.io/badge/VoiceDesign-HuggingFace-orange)](https://huggingface.co/Aratako/Irodori-TTS-500M-v2-VoiceDesign)

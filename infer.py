@@ -171,7 +171,14 @@ def main() -> None:
             "Defaults to checkpoint metadata max_caption_len when available, else max_text_len."
         ),
     )
-    parser.add_argument("--num-steps", type=int, default=40)
+    parser.add_argument("--num-steps", type=int, default=6)
+    parser.add_argument(
+        "--t-schedule-mode",
+        choices=["linear", "sway"],
+        default="sway",
+        help="Timestep schedule for RF sampling (default: sway).",
+    )
+    parser.add_argument("--sway-coeff", type=float, default=-1.0)
     parser.add_argument(
         "--num-candidates",
         type=int,
@@ -379,6 +386,8 @@ def main() -> None:
             max_text_len=None if args.max_text_len is None else int(args.max_text_len),
             max_caption_len=None if args.max_caption_len is None else int(args.max_caption_len),
             num_steps=int(args.num_steps),
+            t_schedule_mode=str(args.t_schedule_mode),
+            sway_coeff=float(args.sway_coeff),
             cfg_scale_text=cfg_scale_text,
             cfg_scale_caption=cfg_scale_caption,
             cfg_scale_speaker=cfg_scale_speaker,
