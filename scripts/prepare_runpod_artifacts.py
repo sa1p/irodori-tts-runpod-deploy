@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--base-checkpoint",
-        default="models/Irodori-TTS-500M-v2/model.safetensors",
+        default="models/Irodori-TTS-500M-v3/model.safetensors",
         help="Base Irodori checkpoint used by all LoRA adapters.",
     )
     parser.add_argument(
@@ -87,7 +87,7 @@ def main() -> None:
     payload = json.loads(registry_path.read_text(encoding="utf-8"))
 
     output_models = output_root / "outputs" / "irodori_loras"
-    output_base = output_root / "models" / "Irodori-TTS-500M-v2" / "model.safetensors"
+    output_base = output_root / "models" / "Irodori-TTS-500M-v3" / "model.safetensors"
     output_refs = output_root / "refs"
     output_configs = output_root / "configs"
     output_configs.mkdir(parents=True, exist_ok=True)
@@ -120,7 +120,7 @@ def main() -> None:
             copy_adapter_dir(adapter_src, adapter_dst, copy_enabled=args.copy)
             model_entry = {
                 "id": model_id,
-                "base_checkpoint": f"{runpod_root}/models/Irodori-TTS-500M-v2/model.safetensors",
+                "base_checkpoint": f"{runpod_root}/models/Irodori-TTS-500M-v3/model.safetensors",
                 "lora_adapter": f"{runpod_root}/outputs/irodori_loras/{model_id}/checkpoint/checkpoint_final",
                 "ref_wav": f"{runpod_root}/refs/{model_id}/reference{ref_suffix}",
                 "enabled": True,

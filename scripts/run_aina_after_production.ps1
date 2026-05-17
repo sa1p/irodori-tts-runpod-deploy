@@ -123,7 +123,7 @@ $resume = Get-ChildItem -LiteralPath $checkpointDir -Directory -Filter "checkpoi
 
 $trainArgs = @(
     "train.py",
-    "--config", "configs\train_500m_v2_lora_kohaku.yaml",
+    "--config", "configs\train_500m_v3_lora.yaml",
     "--manifest", "data\irodori_training\aina001\train_manifest.jsonl",
     "--output-dir", $checkpointDir,
     "--device", $Device,
@@ -132,14 +132,14 @@ $trainArgs = @(
 if ($resume) {
     $trainArgs += @("--resume", $resume.FullName)
 } else {
-    $trainArgs += @("--init-checkpoint", "models\Irodori-TTS-500M-v2\model.safetensors")
+    $trainArgs += @("--init-checkpoint", "models\Irodori-TTS-500M-v3\model.safetensors")
 }
 Invoke-Step "train_aina_lora" $trainArgs
 
 Invoke-Step "convert_aina_lora" @(
     "convert_checkpoint_to_safetensors.py",
     "outputs\irodori_loras\aina001\checkpoint\checkpoint_final",
-    "--base-checkpoint", "models\Irodori-TTS-500M-v2\model.safetensors",
+    "--base-checkpoint", "models\Irodori-TTS-500M-v3\model.safetensors",
     "--output", "outputs\irodori_loras\aina001\aina001_merged.safetensors"
 )
 

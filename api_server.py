@@ -54,6 +54,9 @@ class TTSRequest(BaseModel):
     auto_split: bool = True
     max_chunk_chars: int = Field(default=100, ge=20, le=100)
     chunk_seconds: float | None = Field(default=None, gt=0.0, le=60.0)
+    duration_scale: float = Field(default=1.0, gt=0.0, le=4.0)
+    min_seconds: float = Field(default=0.5, gt=0.0, le=60.0)
+    max_seconds: float = Field(default=30.0, gt=0.0, le=60.0)
     chunk_silence_ms: int = Field(default=350, ge=0, le=2000)
     chunk_tail_padding_ms: int = Field(default=250, ge=0, le=2000)
     trim_tail: bool = True
@@ -63,7 +66,7 @@ class TTSRequest(BaseModel):
     sway_coeff: float = Field(default=-1.0, ge=-2.0, le=2.0)
     cfg_scale_text: float = Field(default=3.0, ge=0.0, le=8.0)
     cfg_scale_speaker: float = Field(default=5.0, ge=0.0, le=10.0)
-    seconds: float = Field(default=30.0, gt=0.0, le=60.0)
+    seconds: float | None = Field(default=None, gt=0.0, le=60.0)
 
 
 class ModelRegistry:
@@ -266,7 +269,6 @@ def build_runtime_key(spec: ModelSpec) -> RuntimeKey:
         codec_precision=os.getenv("IRODORI_CODEC_PRECISION", "fp32"),
         codec_deterministic_encode=_env_bool("IRODORI_CODEC_DETERMINISTIC_ENCODE", True),
         codec_deterministic_decode=_env_bool("IRODORI_CODEC_DETERMINISTIC_DECODE", True),
-        enable_watermark=_env_bool("IRODORI_ENABLE_WATERMARK", False),
         compile_model=_env_bool("IRODORI_COMPILE_MODEL", False),
         compile_dynamic=_env_bool("IRODORI_COMPILE_DYNAMIC", False),
     )
@@ -612,8 +614,16 @@ def _concat_audio_segments(
     return torch.cat(parts, dim=1)
 
 
-def _resolve_chunk_seconds(req: TTSRequest) -> float:
-    return float(req.chunk_seconds if req.chunk_seconds is not None else req.seconds)
+def _resolve_chunk_seconds(req: TTSRequest) -> float | None:
+    if req.chunk_seconds is not None:
+        return float(req.chunk_seconds)
+    if req.seconds is not None:
+        return float(req.seconds)
+    return None
+
+
+def _format_seconds_header(seconds: float | None) -> str:
+    return "auto" if seconds is None else f"{seconds:.2f}"
 
 
 def _chunk_batch_size() -> int:
@@ -724,7 +734,7 @@ def _iter_mp3_stream(
     key: RuntimeKey,
     req: TTSRequest,
     chunks: list[str],
-    chunk_seconds: list[float],
+    chunk_seconds: list[float | None],
 ) -> Iterator[bytes]:
     request_started_at = time.perf_counter()
     output_queue: queue.Queue[bytes | object] = queue.Queue()
@@ -778,11 +788,11 @@ def _iter_mp3_stream(
                 for index, (chunk, seconds) in enumerate(zip(chunks, chunk_seconds, strict=True), start=1):
                     chunk_seed = None if req.seed is None else req.seed + index - 1
                     LOGGER.info(
-                        "[tts:stream] chunk %d/%d chars=%d seconds=%.2f seed=%s text=%r",
+                        "[tts:stream] chunk %d/%d chars=%d seconds=%s seed=%s text=%r",
                         index,
                         len(chunks),
                         len(chunk),
-                        seconds,
+                        _format_seconds_header(seconds),
                         "random" if chunk_seed is None else chunk_seed,
                         _preview_chunk(chunk),
                     )
@@ -797,6 +807,9 @@ def _iter_mp3_stream(
                             num_candidates=1,
                             decode_mode="sequential",
                             seconds=seconds,
+                            duration_scale=req.duration_scale,
+                            min_seconds=req.min_seconds,
+                            max_seconds=req.max_seconds,
                             max_ref_seconds=30.0,
                             max_text_len=None,
                             num_steps=req.num_steps,
@@ -985,7 +998,7 @@ def tts(req: TTSRequest) -> Response:
             used_seeds: list[int | None] = []
             sample_rate: int | None = None
             resolved_chunk_seconds = _resolve_chunk_seconds(req)
-            chunk_seconds: list[float] = [resolved_chunk_seconds for _chunk in chunks]
+            chunk_seconds: list[float | None] = [resolved_chunk_seconds for _chunk in chunks]
             LOGGER.info(
                 "[tts] split model_id=%s mode=%s auto_split=%s chunks=%d max_chunk_chars=%d",
                 spec.id,
@@ -996,16 +1009,17 @@ def tts(req: TTSRequest) -> Response:
             )
             for index, (chunk, seconds) in enumerate(zip(chunks, chunk_seconds, strict=True), start=1):
                 LOGGER.info(
-                    "[tts] chunk %d/%d chars=%d seconds=%.2f seed=%s text=%r",
+                    "[tts] chunk %d/%d chars=%d seconds=%s seed=%s text=%r",
                     index,
                     len(chunks),
                     len(chunk),
-                    seconds,
+                    _format_seconds_header(seconds),
                     "random" if req.seed is None else req.seed + index - 1,
                     _preview_chunk(chunk),
                 )
 
-            chunk_batch_size = min(_chunk_batch_size(), len(chunks))
+            auto_duration = any(seconds is None for seconds in chunk_seconds)
+            chunk_batch_size = 1 if auto_duration else min(_chunk_batch_size(), len(chunks))
             LOGGER.info("[tts] chunk_batch_size=%d", chunk_batch_size)
             for batch_start in range(0, len(chunks), chunk_batch_size):
                 batch_end = min(len(chunks), batch_start + chunk_batch_size)
@@ -1023,6 +1037,9 @@ def tts(req: TTSRequest) -> Response:
                             num_candidates=1,
                             decode_mode="batch" if batch_end - batch_start > 1 else "sequential",
                             seconds=chunk_seconds[index],
+                            duration_scale=req.duration_scale,
+                            min_seconds=req.min_seconds,
+                            max_seconds=req.max_seconds,
                             max_ref_seconds=30.0,
                             max_text_len=None,
                             num_steps=req.num_steps,
@@ -1035,7 +1052,10 @@ def tts(req: TTSRequest) -> Response:
                             trim_tail=req.trim_tail,
                         )
                     )
-                results = runtime.synthesize_batch(batch_reqs)
+                if auto_duration:
+                    results = [runtime.synthesize(batch_req) for batch_req in batch_reqs]
+                else:
+                    results = runtime.synthesize_batch(batch_reqs)
                 for result in results:
                     if sample_rate is None:
                         sample_rate = result.sample_rate
@@ -1083,7 +1103,12 @@ def tts(req: TTSRequest) -> Response:
         "X-Irodori-Sway-Coeff": str(req.sway_coeff),
         "X-Irodori-Chunk-Count": str(len(chunks)),
         "X-Irodori-Chunk-Batch-Size": str(chunk_batch_size),
-        "X-Irodori-Chunk-Seconds": ",".join(f"{seconds:.2f}" for seconds in chunk_seconds),
+        "X-Irodori-Chunk-Seconds": ",".join(
+            _format_seconds_header(seconds) for seconds in chunk_seconds
+        ),
+        "X-Irodori-Duration-Scale": str(req.duration_scale),
+        "X-Irodori-Min-Seconds": str(req.min_seconds),
+        "X-Irodori-Max-Seconds": str(req.max_seconds),
         "X-Irodori-Trim-Tail": "1" if req.trim_tail else "0",
         "X-Irodori-Runtime-Reloaded": "1" if reloaded else "0",
     }
@@ -1126,7 +1151,12 @@ def tts_stream(req: TTSRequest) -> StreamingResponse:
         "X-Irodori-T-Schedule-Mode": req.t_schedule_mode,
         "X-Irodori-Sway-Coeff": str(req.sway_coeff),
         "X-Irodori-Chunk-Count": str(len(chunks)),
-        "X-Irodori-Chunk-Seconds": ",".join(f"{seconds:.2f}" for seconds in chunk_seconds),
+        "X-Irodori-Chunk-Seconds": ",".join(
+            _format_seconds_header(seconds) for seconds in chunk_seconds
+        ),
+        "X-Irodori-Duration-Scale": str(req.duration_scale),
+        "X-Irodori-Min-Seconds": str(req.min_seconds),
+        "X-Irodori-Max-Seconds": str(req.max_seconds),
         "X-Irodori-Trim-Tail": "1" if req.trim_tail else "0",
     }
     return StreamingResponse(

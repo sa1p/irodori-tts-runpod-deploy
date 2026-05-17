@@ -11,7 +11,7 @@ adapters:
 ```text
 /workspace/irodori_artifacts/
   configs/model_registry.runpod.json
-  models/Irodori-TTS-500M-v2/model.safetensors
+  models/Irodori-TTS-500M-v3/model.safetensors
   outputs/irodori_loras/<model_id>/checkpoint/checkpoint_final/
     adapter_config.json
     adapter_model.safetensors

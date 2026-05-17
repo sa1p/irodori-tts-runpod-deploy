@@ -232,3 +232,5 @@ __marimo__/
 
 gradio_outputs/
 gradio_outputs_voicedesign/
+outputs/
+data/

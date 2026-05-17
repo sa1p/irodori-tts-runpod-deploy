@@ -29,10 +29,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--training-data-root", default="data/irodori_training")
     parser.add_argument("--distilled-root", default="data/distilled")
     parser.add_argument("--output-root", default="outputs/irodori_loras")
-    parser.add_argument("--config", default="configs/train_500m_v2_lora_kohaku.yaml")
+    parser.add_argument("--config", default="configs/train_500m_v3_lora.yaml")
     parser.add_argument(
         "--base-checkpoint",
-        default="models/Irodori-TTS-500M-v2/model.safetensors",
+        default="models/Irodori-TTS-500M-v3/model.safetensors",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--target-sample-rate", type=int, default=48000)

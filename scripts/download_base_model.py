@@ -7,10 +7,10 @@ from huggingface_hub import hf_hub_download
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Download the Irodori-TTS v2 base checkpoint.")
-    parser.add_argument("--repo-id", default="Aratako/Irodori-TTS-500M-v2")
+    parser = argparse.ArgumentParser(description="Download the Irodori-TTS v3 base checkpoint.")
+    parser.add_argument("--repo-id", default="Aratako/Irodori-TTS-500M-v3")
     parser.add_argument("--filename", default="model.safetensors")
-    parser.add_argument("--output-dir", default="models/Irodori-TTS-500M-v2")
+    parser.add_argument("--output-dir", default="models/Irodori-TTS-500M-v3")
     return parser.parse_args()
 
 

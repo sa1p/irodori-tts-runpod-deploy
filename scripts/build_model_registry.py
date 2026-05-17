@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated model ids, or @file. Defaults to inventory items or configured targets.",
     )
     parser.add_argument("--checkpoint-root", default="outputs/irodori_loras")
-    parser.add_argument("--base-checkpoint", default="models/Irodori-TTS-500M-v2/model.safetensors")
+    parser.add_argument("--base-checkpoint", default="models/Irodori-TTS-500M-v3/model.safetensors")
     parser.add_argument("--training-data-root", default="data/irodori_training")
     parser.add_argument("--distilled-root", default="data/distilled")
     parser.add_argument("--output", default="configs/model_registry.local.json")
