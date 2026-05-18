@@ -11,6 +11,11 @@ reference WAV. The runtime uses an LRU cache, so `IRODORI_MAX_CACHED_RUNTIMES=1`
 keeps VRAM low and reloads on model switches, while larger values trade VRAM for
 lower switch latency.
 
+Within each loaded runtime, reference audio is also encoded once and reused from
+an in-process LRU cache. This avoids re-encoding the same reference WAV on every
+chunk/request. Tune it with `IRODORI_REF_LATENT_CACHE_SIZE` (default: `64`, set
+`0` to disable).
+
 ```powershell
 $env:IRODORI_MODEL_REGISTRY = "configs/model_registry.example.json"
 $env:IRODORI_MAX_CACHED_RUNTIMES = "1"
@@ -98,6 +103,12 @@ By default, API synthesis uses the fast production sampler:
 `trim_tail=true`. When `seconds` and `chunk_seconds` are omitted, v3
 checkpoints use automatic duration prediction; use `duration_scale` to make the
 predicted length longer or shorter.
+
+For v3 reference-voice tuning, `/v1/tts` and `/v1/tts/stream` accept optional
+`reference_wav`, `reference_latent`, `cfg_scale_speaker`, `speaker_kv_scale`,
+`speaker_kv_min_t`, and `speaker_kv_max_layers`. If `reference_wav` and
+`reference_latent` are omitted, the registry/default reference WAV is used, so
+existing clients remain compatible.
 
 ```powershell
 $env:IRODORI_CHECKPOINT = "outputs/kohaku_lora/kohaku_lora_merged.safetensors"

@@ -4,9 +4,11 @@ import gc
 import hashlib
 import json
 import math
+import os
 import secrets
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -186,6 +188,13 @@ def _normalize_lora_load_mode(mode: str | None) -> str:
     )
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return int(raw)
+
+
 @dataclass
 class SamplingRequest:
     text: str
@@ -227,6 +236,17 @@ class SamplingRequest:
     tail_std_threshold: float = 0.05
     tail_mean_threshold: float = 0.1
     lora_adapter: str | None = None
+
+
+@dataclass(frozen=True)
+class _ReferenceLatentCacheKey:
+    source_kind: str
+    source_path: str
+    source_size: int | None
+    source_mtime_ns: int | None
+    max_ref_seconds: float | None
+    ref_normalize_db: float | None
+    ref_ensure_max: bool
 
 
 @dataclass
@@ -527,6 +547,10 @@ class InferenceRuntime:
         self._infer_lock = threading.Lock()
         self._model_dtype = model_dtype
         self._lora_adapter_names: dict[str, str] = {}
+        self._reference_latent_cache: OrderedDict[
+            _ReferenceLatentCacheKey, torch.Tensor
+        ] = OrderedDict()
+        self._reference_latent_cache_size = _env_int("IRODORI_REF_LATENT_CACHE_SIZE", 64)
 
     def _clear_model_memory(self) -> None:
         gc.collect()
@@ -883,6 +907,72 @@ class InferenceRuntime:
         self.model.eval()
         return nullcontext()
 
+    def _reference_latent_cache_key(
+        self, req: SamplingRequest
+    ) -> _ReferenceLatentCacheKey | None:
+        if self._reference_latent_cache_size <= 0:
+            return None
+        source_kind: str
+        source_path_raw: str | None
+        if req.ref_latent is not None:
+            source_kind = "latent"
+            source_path_raw = req.ref_latent
+        elif req.ref_wav is not None:
+            source_kind = "wav"
+            source_path_raw = req.ref_wav
+        else:
+            return None
+
+        path = Path(source_path_raw).expanduser()
+        try:
+            resolved = path.resolve(strict=False)
+        except OSError:
+            resolved = path.absolute()
+        try:
+            stat = resolved.stat()
+            source_size: int | None = int(stat.st_size)
+            source_mtime_ns: int | None = int(stat.st_mtime_ns)
+        except OSError:
+            source_size = None
+            source_mtime_ns = None
+
+        return _ReferenceLatentCacheKey(
+            source_kind=source_kind,
+            source_path=str(resolved),
+            source_size=source_size,
+            source_mtime_ns=source_mtime_ns,
+            max_ref_seconds=None
+            if req.max_ref_seconds is None
+            else float(req.max_ref_seconds),
+            ref_normalize_db=None
+            if req.ref_normalize_db is None
+            else float(req.ref_normalize_db),
+            ref_ensure_max=bool(req.ref_ensure_max),
+        )
+
+    def _get_cached_reference_latent(
+        self, cache_key: _ReferenceLatentCacheKey | None
+    ) -> torch.Tensor | None:
+        if cache_key is None:
+            return None
+        ref_latent = self._reference_latent_cache.get(cache_key)
+        if ref_latent is None:
+            return None
+        self._reference_latent_cache.move_to_end(cache_key)
+        return ref_latent
+
+    def _remember_reference_latent(
+        self,
+        cache_key: _ReferenceLatentCacheKey | None,
+        ref_latent: torch.Tensor,
+    ) -> None:
+        if cache_key is None or self._reference_latent_cache_size <= 0:
+            return
+        self._reference_latent_cache[cache_key] = ref_latent.detach().cpu()
+        self._reference_latent_cache.move_to_end(cache_key)
+        while len(self._reference_latent_cache) > self._reference_latent_cache_size:
+            self._reference_latent_cache.popitem(last=False)
+
     def _load_reference_latent(
         self,
         *,
@@ -927,7 +1017,12 @@ class InferenceRuntime:
                 ),
             )
 
-        if req.ref_latent is not None:
+        cache_key = self._reference_latent_cache_key(req)
+        cached_ref_latent = self._get_cached_reference_latent(cache_key)
+        if cached_ref_latent is not None:
+            messages.append("info: using cached reference latent.")
+            ref_latent = cached_ref_latent.to(dtype=runtime_dtype)
+        elif req.ref_latent is not None:
             latent_raw = torch.load(req.ref_latent, map_location="cpu", weights_only=True)
             ref_latent = _coerce_latent_shape(
                 latent_raw, latent_dim=self.model_cfg.latent_dim
@@ -962,6 +1057,9 @@ class InferenceRuntime:
                 "Trimming reference latent."
             )
             ref_latent = ref_latent[:, :max_ref_latent_steps]
+
+        if cached_ref_latent is None:
+            self._remember_reference_latent(cache_key, ref_latent)
 
         ref_latent_patched = patchify_latent(ref_latent, self.model_cfg.latent_patch_size).to(
             device=self.model_device,
@@ -1708,6 +1806,7 @@ class InferenceRuntime:
         ]
 
     def unload(self) -> None:
+        self._reference_latent_cache.clear()
         del self.model
         del self.tokenizer
         del self.codec

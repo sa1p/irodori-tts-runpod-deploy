@@ -66,6 +66,11 @@ class TTSRequest(BaseModel):
     sway_coeff: float = Field(default=-1.0, ge=-2.0, le=2.0)
     cfg_scale_text: float = Field(default=3.0, ge=0.0, le=8.0)
     cfg_scale_speaker: float = Field(default=5.0, ge=0.0, le=10.0)
+    speaker_kv_scale: float | None = Field(default=None, gt=0.0)
+    speaker_kv_min_t: float | None = Field(default=None, ge=0.0, le=1.0)
+    speaker_kv_max_layers: int | None = Field(default=None, ge=0)
+    reference_wav: str | None = None
+    reference_latent: str | None = None
     seconds: float | None = Field(default=None, gt=0.0, le=60.0)
 
 
@@ -622,6 +627,12 @@ def _resolve_chunk_seconds(req: TTSRequest) -> float | None:
     return None
 
 
+def _resolve_reference_inputs(spec: ModelSpec, req: TTSRequest) -> tuple[str | None, str | None]:
+    if req.reference_latent:
+        return None, req.reference_latent
+    return req.reference_wav or spec.ref_wav, None
+
+
 def _format_seconds_header(seconds: float | None) -> str:
     return "auto" if seconds is None else f"{seconds:.2f}"
 
@@ -785,6 +796,7 @@ def _iter_mp3_stream(
                 sample_rate: int | None = None
                 channels: int | None = None
                 used_seeds: list[int | None] = []
+                ref_wav, ref_latent = _resolve_reference_inputs(spec, req)
                 for index, (chunk, seconds) in enumerate(zip(chunks, chunk_seconds, strict=True), start=1):
                     chunk_seed = None if req.seed is None else req.seed + index - 1
                     LOGGER.info(
@@ -799,8 +811,8 @@ def _iter_mp3_stream(
                     result = runtime.synthesize(
                         SamplingRequest(
                             text=chunk,
-                            ref_wav=spec.ref_wav,
-                            ref_latent=None,
+                            ref_wav=ref_wav,
+                            ref_latent=ref_latent,
                             no_ref=False,
                             ref_normalize_db=-16.0,
                             ref_ensure_max=True,
@@ -819,6 +831,9 @@ def _iter_mp3_stream(
                             cfg_guidance_mode="independent",
                             cfg_scale_text=req.cfg_scale_text,
                             cfg_scale_speaker=req.cfg_scale_speaker,
+                            speaker_kv_scale=req.speaker_kv_scale,
+                            speaker_kv_min_t=req.speaker_kv_min_t,
+                            speaker_kv_max_layers=req.speaker_kv_max_layers,
                             trim_tail=req.trim_tail,
                         )
                     )
@@ -999,6 +1014,7 @@ def tts(req: TTSRequest) -> Response:
             sample_rate: int | None = None
             resolved_chunk_seconds = _resolve_chunk_seconds(req)
             chunk_seconds: list[float | None] = [resolved_chunk_seconds for _chunk in chunks]
+            ref_wav, ref_latent = _resolve_reference_inputs(spec, req)
             LOGGER.info(
                 "[tts] split model_id=%s mode=%s auto_split=%s chunks=%d max_chunk_chars=%d",
                 spec.id,
@@ -1029,8 +1045,8 @@ def tts(req: TTSRequest) -> Response:
                     batch_reqs.append(
                         SamplingRequest(
                             text=chunks[index],
-                            ref_wav=spec.ref_wav,
-                            ref_latent=None,
+                            ref_wav=ref_wav,
+                            ref_latent=ref_latent,
                             no_ref=False,
                             ref_normalize_db=-16.0,
                             ref_ensure_max=True,
@@ -1049,6 +1065,9 @@ def tts(req: TTSRequest) -> Response:
                             cfg_guidance_mode="independent",
                             cfg_scale_text=req.cfg_scale_text,
                             cfg_scale_speaker=req.cfg_scale_speaker,
+                            speaker_kv_scale=req.speaker_kv_scale,
+                            speaker_kv_min_t=req.speaker_kv_min_t,
+                            speaker_kv_max_layers=req.speaker_kv_max_layers,
                             trim_tail=req.trim_tail,
                         )
                     )
@@ -1101,6 +1120,12 @@ def tts(req: TTSRequest) -> Response:
         "X-Irodori-Num-Steps": str(req.num_steps),
         "X-Irodori-T-Schedule-Mode": req.t_schedule_mode,
         "X-Irodori-Sway-Coeff": str(req.sway_coeff),
+        "X-Irodori-Cfg-Scale-Speaker": str(req.cfg_scale_speaker),
+        "X-Irodori-Speaker-Kv-Scale": "" if req.speaker_kv_scale is None else str(req.speaker_kv_scale),
+        "X-Irodori-Speaker-Kv-Min-T": "" if req.speaker_kv_min_t is None else str(req.speaker_kv_min_t),
+        "X-Irodori-Speaker-Kv-Max-Layers": ""
+        if req.speaker_kv_max_layers is None
+        else str(req.speaker_kv_max_layers),
         "X-Irodori-Chunk-Count": str(len(chunks)),
         "X-Irodori-Chunk-Batch-Size": str(chunk_batch_size),
         "X-Irodori-Chunk-Seconds": ",".join(
@@ -1150,6 +1175,12 @@ def tts_stream(req: TTSRequest) -> StreamingResponse:
         "X-Irodori-Num-Steps": str(req.num_steps),
         "X-Irodori-T-Schedule-Mode": req.t_schedule_mode,
         "X-Irodori-Sway-Coeff": str(req.sway_coeff),
+        "X-Irodori-Cfg-Scale-Speaker": str(req.cfg_scale_speaker),
+        "X-Irodori-Speaker-Kv-Scale": "" if req.speaker_kv_scale is None else str(req.speaker_kv_scale),
+        "X-Irodori-Speaker-Kv-Min-T": "" if req.speaker_kv_min_t is None else str(req.speaker_kv_min_t),
+        "X-Irodori-Speaker-Kv-Max-Layers": ""
+        if req.speaker_kv_max_layers is None
+        else str(req.speaker_kv_max_layers),
         "X-Irodori-Chunk-Count": str(len(chunks)),
         "X-Irodori-Chunk-Seconds": ",".join(
             _format_seconds_header(seconds) for seconds in chunk_seconds
