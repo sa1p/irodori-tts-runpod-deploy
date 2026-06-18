@@ -1,0 +1,8 @@
+FROM s41t0h/irodori-tts-kohaku-api:20260613-distilled-latents
+
+COPY ref_latents/fukami/ /opt/irodori_artifacts/ref_latents_distilled/fukami/
+COPY model_registry.runpod.json /opt/irodori_artifacts/configs/model_registry.runpod.json
+COPY runpod_start_lb.sh /app/scripts/runpod_start_lb.sh
+
+RUN chmod +x /app/scripts/runpod_start_lb.sh
+CMD ["/app/scripts/runpod_start_lb.sh"]

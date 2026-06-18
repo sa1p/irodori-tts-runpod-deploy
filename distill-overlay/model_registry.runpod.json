@@ -1,0 +1,413 @@
+{
+  "default_model_id": "tamaki-default",
+  "models": [
+    {
+      "id": "tamaki-default",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_latent": "/opt/irodori_artifacts/ref_latents/tamaki-default/reference.pt",
+      "enabled": true,
+      "preload": true,
+      "description": "Tamaki default reference latent on base Irodori-TTS-v3"
+    },
+    {
+      "id": "hiyoko_tentyuou",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/hiyoko_tentyuou/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 hiyoko_tentyuou (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "nana02",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/nana02/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 nana02 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "sakura04",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/sakura04/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 sakura04 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "shiori02",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/shiori02/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 shiori02 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "noa01",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/noa01/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 noa01 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "amane04",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/amane04/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 amane04 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "momo02",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/momo02/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 momo02 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "fururu02",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/fururu02/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 fururu02 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "chacha02",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/chacha02/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 chacha02 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "suzuha001",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/suzuha001/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 suzuha001 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "shinon002",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/shinon002/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 shinon002 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "saki003",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/saki003/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 saki003 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "ruri01",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/ruri01/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 ruri01 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "wanko002",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/wanko002/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 wanko002 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "nephil003",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/nephil003/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 nephil003 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "mao005",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/mao005/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 mao005 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "kohaku004",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/kohaku004/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 kohaku004 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "hachiroku_20251208_marged",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/hachiroku_20251208_marged/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 hachiroku_20251208_marged (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "hachiroku_20251208_ml",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/hachiroku_20251208_ml/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 hachiroku_20251208_ml (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "sora003",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/sora003/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 sora003 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "alisa002",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/alisa002/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 alisa002 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "setsuho008",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/setsuho008/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 setsuho008 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "toa002",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/toa002/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 toa002 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "yui003",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/yui003/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 yui003 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "fuu001",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/fuu001/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 fuu001 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "neno003",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/neno003/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 neno003 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "yuna002",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/yuna002/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 yuna002 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "haruka003",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/haruka003/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 haruka003 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "misato003",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/misato003/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 misato003 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "reika004",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/reika004/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 reika004 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "yuu002",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/yuu002/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 yuu002 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "shizune003",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/shizune003/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 shizune003 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "setsuna003",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/setsuna003/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Distilled from sbv2 setsuna003 (2026-06-13), precomputed ref latent"
+    },
+    {
+      "id": "fukami",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents_distilled/fukami/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Fukami reference latent from a08_41197 (2026-05-20)"
+    },
+    {
+      "id": "M001_2f2ae696",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents/M001_2f2ae696/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA trained from recorded dataset"
+    },
+    {
+      "id": "M003_2cf01874",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents/M003_2cf01874/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA trained from recorded dataset"
+    },
+    {
+      "id": "M006_b8b5fe66",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents/M006_b8b5fe66/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA trained from recorded dataset"
+    },
+    {
+      "id": "M004_4d8b14ad",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents/M004_4d8b14ad/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA trained from recorded dataset"
+    },
+    {
+      "id": "M005_5c25991f",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents/M005_5c25991f/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA trained from recorded dataset"
+    },
+    {
+      "id": "aina001",
+      "checkpoint": "/opt/irodori_artifacts/models/Irodori-TTS-500M-v3/model.safetensors",
+      "ref_wav": null,
+      "ref_latent": "/opt/irodori_artifacts/ref_latents/aina001/reference.pt",
+      "lora_adapter": null,
+      "enabled": true,
+      "preload": false,
+      "description": "Irodori LoRA trained from recorded dataset"
+    }
+  ]
+}
