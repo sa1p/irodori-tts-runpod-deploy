@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
 import os
 import queue
 import subprocess
+import tempfile
 import threading
 import time
 from collections import OrderedDict
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from io import BytesIO
 from pathlib import Path
@@ -36,7 +40,8 @@ LOGGER = logging.getLogger("uvicorn.error")
 class ModelSpec:
     id: str
     checkpoint: str
-    ref_wav: str
+    ref_wav: str | None = None
+    ref_latent: str | None = None
     lora_adapter: str | None = None
     enabled: bool = True
     preload: bool = False
@@ -44,7 +49,16 @@ class ModelSpec:
 
     @property
     def mode(self) -> str:
-        return "lora" if self.lora_adapter else "checkpoint"
+        if self.ref_latent:
+            return "reference_latent"
+        return "reference_wav"
+
+    @property
+    def available_modes(self) -> list[str]:
+        modes = [self.mode]
+        if self.lora_adapter:
+            modes.append("lora")
+        return modes
 
 
 class TTSRequest(BaseModel):
@@ -61,7 +75,7 @@ class TTSRequest(BaseModel):
     chunk_tail_padding_ms: int = Field(default=250, ge=0, le=2000)
     trim_tail: bool = True
     seed: int | None = None
-    num_steps: int = Field(default=6, ge=4, le=80)
+    num_steps: int = Field(default=40, ge=4, le=80)
     t_schedule_mode: Literal["linear", "sway"] = "sway"
     sway_coeff: float = Field(default=-1.0, ge=-2.0, le=2.0)
     cfg_scale_text: float = Field(default=3.0, ge=0.0, le=8.0)
@@ -69,7 +83,10 @@ class TTSRequest(BaseModel):
     speaker_kv_scale: float | None = Field(default=None, gt=0.0)
     speaker_kv_min_t: float | None = Field(default=None, ge=0.0, le=1.0)
     speaker_kv_max_layers: int | None = Field(default=None, ge=0)
+    use_lora: bool = False
     reference_wav: str | None = None
+    reference_wav_base64: str | None = None
+    reference_wav_mime: str | None = None
     reference_latent: str | None = None
     seconds: float | None = Field(default=None, gt=0.0, le=60.0)
 
@@ -108,11 +125,27 @@ class ModelRegistry:
             else:
                 checkpoint = _resolve_maybe_relative(str(item["checkpoint"]), base_dir)
                 lora_adapter = None
-            ref_wav = _resolve_maybe_relative(str(item.get("ref_wav") or item["reference_wav"]), base_dir)
+            raw_ref_wav = item.get("ref_wav") or item.get("reference_wav")
+            raw_ref_latent = item.get("ref_latent") or item.get("reference_latent")
+            if raw_ref_wav is None and raw_ref_latent is None:
+                raise ValueError(
+                    f"model is missing ref_wav/reference_wav or ref_latent/reference_latent: {model_id}"
+                )
+            ref_wav = (
+                _resolve_maybe_relative(str(raw_ref_wav), base_dir)
+                if raw_ref_wav is not None
+                else None
+            )
+            ref_latent = (
+                _resolve_maybe_relative(str(raw_ref_latent), base_dir)
+                if raw_ref_latent is not None
+                else None
+            )
             spec = ModelSpec(
                 id=model_id,
                 checkpoint=checkpoint,
                 ref_wav=ref_wav,
+                ref_latent=ref_latent,
                 lora_adapter=lora_adapter,
                 enabled=bool(item.get("enabled", True)),
                 preload=bool(item.get("preload", False)),
@@ -163,13 +196,19 @@ class ModelRegistry:
                     **asdict(spec),
                     "is_default": spec.id == self.default_model_id,
                     "mode": spec.mode,
+                    "available_modes": spec.available_modes,
                     "checkpoint_exists": Path(spec.checkpoint).is_file(),
                     "lora_adapter_exists": (
                         is_lora_adapter_dir(spec.lora_adapter)
                         if spec.lora_adapter is not None
                         else None
                     ),
-                    "ref_wav_exists": Path(spec.ref_wav).is_file(),
+                    "ref_wav_exists": (
+                        Path(spec.ref_wav).is_file() if spec.ref_wav is not None else None
+                    ),
+                    "ref_latent_exists": (
+                        Path(spec.ref_latent).is_file() if spec.ref_latent is not None else None
+                    ),
                 }
             )
         return rows
@@ -234,6 +273,34 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_int(name: str, default: int, *, minimum: int | None = None) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        value = default
+    else:
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+    if minimum is not None:
+        value = max(minimum, value)
+    return value
+
+
+def _env_float(name: str, default: float, *, minimum: float | None = None) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        value = default
+    else:
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a number, got {raw!r}") from exc
+    if minimum is not None:
+        value = max(minimum, value)
+    return value
+
+
 def _lora_load_mode() -> str:
     raw = os.getenv("IRODORI_LORA_LOAD_MODE", "merged")
     value = raw.strip().lower()
@@ -261,8 +328,8 @@ def _resolve_maybe_relative(raw: str, base_dir: Path) -> str:
     return str(path.resolve())
 
 
-def build_runtime_key(spec: ModelSpec) -> RuntimeKey:
-    lora_mode = _lora_load_mode() if spec.lora_adapter is not None else "none"
+def build_runtime_key(spec: ModelSpec, *, use_lora: bool = False) -> RuntimeKey:
+    lora_mode = _lora_load_mode() if use_lora and spec.lora_adapter is not None else "none"
     return RuntimeKey(
         checkpoint=spec.checkpoint,
         model_device=os.getenv("IRODORI_MODEL_DEVICE", "cuda"),
@@ -280,6 +347,9 @@ def build_runtime_key(spec: ModelSpec) -> RuntimeKey:
 
 
 SENTENCE_END_CHARS = {".", "!", "?", "\u3002", "\uff01", "\uff1f"}
+QUOTED_NON_BREAK_SENTENCE_END_CHARS = {"!", "?", "\uff01", "\uff1f"}
+QUOTE_OPENERS = {"\u300c": "\u300d", "\u300e": "\u300f"}
+QUOTE_CLOSERS = set(QUOTE_OPENERS.values())
 SOFT_BREAK_CHARS = {
     ",",
     ";",
@@ -466,9 +536,14 @@ def _is_expressive_break_end(prev: str, ch: str, next_ch: str) -> bool:
     return False
 
 
+def _is_non_break_sentence_end(ch: str, quote_stack: list[str]) -> bool:
+    return bool(quote_stack) and ch in QUOTED_NON_BREAK_SENTENCE_END_CHARS
+
+
 def _split_tts_text_line(text: str, max_chunk_chars: int) -> list[str]:
     chunks: list[str] = []
     current: list[str] = []
+    quote_stack: list[str] = []
     max_chunk_chars = max(20, int(max_chunk_chars))
     natural_break_min_chars = _natural_break_min_chars(max_chunk_chars)
 
@@ -513,6 +588,7 @@ def _split_tts_text_line(text: str, max_chunk_chars: int) -> list[str]:
     for position, ch in enumerate(text):
         next_ch = text[position + 1] if position + 1 < len(text) else ""
         prev = current[-1] if current else ""
+        quote_stack_before = list(quote_stack)
         if (
             current
             and _is_emoji_codepoint(ch)
@@ -523,7 +599,14 @@ def _split_tts_text_line(text: str, max_chunk_chars: int) -> list[str]:
 
         current.append(ch)
 
-        if ch in SENTENCE_END_CHARS:
+        if ch in QUOTE_OPENERS:
+            quote_stack.append(QUOTE_OPENERS[ch])
+        elif quote_stack and ch == quote_stack[-1]:
+            quote_stack.pop()
+        elif ch in QUOTE_CLOSERS:
+            quote_stack.clear()
+
+        if ch in SENTENCE_END_CHARS and not _is_non_break_sentence_end(ch, quote_stack_before):
             flush()
             continue
 
@@ -627,10 +710,127 @@ def _resolve_chunk_seconds(req: TTSRequest) -> float | None:
     return None
 
 
+def _validate_request_limits(
+    req: TTSRequest,
+    *,
+    chunks: list[str],
+    resolved_chunk_seconds: float | None,
+) -> None:
+    max_text_chars = _env_int("IRODORI_MAX_TEXT_CHARS", 0, minimum=0)
+    if max_text_chars > 0 and len(req.text) > max_text_chars:
+        raise HTTPException(
+            status_code=413,
+            detail=f"text is too long; max chars is {max_text_chars}",
+        )
+
+    max_chunks = _env_int("IRODORI_MAX_CHUNKS", 0, minimum=0)
+    if max_chunks > 0 and len(chunks) > max_chunks:
+        raise HTTPException(
+            status_code=413,
+            detail=f"too many chunks after splitting; max chunks is {max_chunks}",
+        )
+
+    max_total_seconds = _env_float("IRODORI_MAX_TOTAL_SECONDS", 0.0, minimum=0.0)
+    if max_total_seconds > 0 and resolved_chunk_seconds is not None:
+        requested_seconds = resolved_chunk_seconds * len(chunks)
+        if requested_seconds > max_total_seconds:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "requested audio duration is too long; "
+                    f"max total seconds is {max_total_seconds:g}"
+                ),
+            )
+
+
+def _max_reference_upload_bytes() -> int:
+    raw = os.getenv("IRODORI_MAX_REFERENCE_UPLOAD_BYTES", str(32 * 1024 * 1024))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"IRODORI_MAX_REFERENCE_UPLOAD_BYTES must be an integer, got {raw!r}"
+        ) from exc
+    return max(1, value)
+
+
+def _reference_upload_dir() -> Path:
+    raw = os.getenv("IRODORI_REFERENCE_UPLOAD_DIR")
+    root = Path(raw) if raw else Path(tempfile.gettempdir()) / "irodori_reference_uploads"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _decode_reference_wav_base64(raw: str, mime: str | None) -> str:
+    payload = str(raw).strip()
+    if payload.startswith("data:"):
+        header, separator, data = payload.partition(",")
+        if not separator:
+            raise ValueError("reference_wav_base64 data URL is missing comma separator")
+        if ";base64" not in header:
+            raise ValueError("reference_wav_base64 data URL must be base64 encoded")
+        if mime is None:
+            mime = header[5:].split(";", 1)[0] or None
+        payload = data
+
+    normalized_mime = (mime or "").strip().lower()
+    if normalized_mime and normalized_mime not in {
+        "audio/wav",
+        "audio/wave",
+        "audio/x-wav",
+        "audio/vnd.wave",
+        "application/octet-stream",
+    }:
+        raise ValueError(f"reference_wav_base64 must be WAV audio, got {mime!r}")
+
+    compact = "".join(payload.split())
+    max_bytes = _max_reference_upload_bytes()
+    if len(compact) > max_bytes * 2:
+        raise ValueError(
+            f"reference_wav_base64 is too large; max decoded bytes is {max_bytes}"
+        )
+
+    try:
+        data = base64.b64decode(compact, validate=True)
+    except Exception as exc:
+        raise ValueError("reference_wav_base64 is not valid base64") from exc
+
+    if not data:
+        raise ValueError("reference_wav_base64 decoded to an empty file")
+    if len(data) > max_bytes:
+        raise ValueError(f"reference_wav_base64 is too large; max decoded bytes is {max_bytes}")
+
+    digest = hashlib.sha256(data).hexdigest()
+    upload_dir = _reference_upload_dir()
+    path = upload_dir / f"{digest}.wav"
+    if not path.exists():
+        tmp_file = tempfile.NamedTemporaryFile(
+            delete=False,
+            dir=upload_dir,
+            prefix=f"{digest}.",
+            suffix=".tmp",
+        )
+        tmp_path = Path(tmp_file.name)
+        try:
+            with tmp_file:
+                tmp_file.write(data)
+            tmp_path.replace(path)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
+    return str(path)
+
+
 def _resolve_reference_inputs(spec: ModelSpec, req: TTSRequest) -> tuple[str | None, str | None]:
     if req.reference_latent:
         return None, req.reference_latent
-    return req.reference_wav or spec.ref_wav, None
+    if req.reference_wav_base64:
+        return _decode_reference_wav_base64(req.reference_wav_base64, req.reference_wav_mime), None
+    if req.reference_wav:
+        return req.reference_wav, None
+    if spec.ref_latent:
+        return None, spec.ref_latent
+    return spec.ref_wav, None
 
 
 def _format_seconds_header(seconds: float | None) -> str:
@@ -746,13 +946,40 @@ def _iter_mp3_stream(
     req: TTSRequest,
     chunks: list[str],
     chunk_seconds: list[float | None],
+    *,
+    release_synthesis_lock: bool = False,
 ) -> Iterator[bytes]:
     request_started_at = time.perf_counter()
-    output_queue: queue.Queue[bytes | object] = queue.Queue()
-    read_size = int(os.getenv("IRODORI_STREAM_READ_SIZE", "65536"))
+    output_queue: queue.Queue[bytes | object] = queue.Queue(
+        maxsize=_env_int("IRODORI_STREAM_QUEUE_MAX_ITEMS", 8, minimum=1)
+    )
+    stop_event = threading.Event()
+    read_size = _env_int("IRODORI_STREAM_READ_SIZE", 65536, minimum=1)
+    proc_lock = threading.Lock()
+    active_proc: subprocess.Popen[bytes] | None = None
+
+    def queue_put(item: bytes | object) -> bool:
+        while not stop_event.is_set():
+            try:
+                output_queue.put(item, timeout=0.5)
+                return True
+            except queue.Full:
+                continue
+        return False
 
     def put_end() -> None:
-        output_queue.put(_STREAM_END)
+        queue_put(_STREAM_END)
+
+    def set_active_proc(proc: subprocess.Popen[bytes] | None) -> None:
+        nonlocal active_proc
+        with proc_lock:
+            active_proc = proc
+
+    def kill_active_proc() -> None:
+        with proc_lock:
+            proc = active_proc
+        if proc is not None and proc.poll() is None:
+            proc.kill()
 
     def read_stdout(proc: subprocess.Popen[bytes]) -> None:
         try:
@@ -762,7 +989,8 @@ def _iter_mp3_stream(
                 data = proc.stdout.read(read_size)
                 if not data:
                     break
-                output_queue.put(data)
+                if not queue_put(data):
+                    break
         finally:
             put_end()
 
@@ -770,117 +998,149 @@ def _iter_mp3_stream(
         proc: subprocess.Popen[bytes] | None = None
         reader: threading.Thread | None = None
         try:
-            with _synthesis_lock:
-                runtime, reloaded = RUNTIME_CACHE.get(key)
-                if spec.lora_adapter is not None and key.lora_load_mode == "delta":
-                    runtime.ensure_lora_delta_adapter(
-                        adapter_name=spec.id,
-                        adapter_path=spec.lora_adapter,
-                    )
-                elif spec.lora_adapter is not None and key.lora_load_mode in {"dynamic", "reload"}:
-                    runtime.ensure_lora_adapter(
-                        adapter_name=spec.id,
-                        adapter_path=spec.lora_adapter,
-                        replace_existing=True,
-                    )
+            with _release_synthesis_lock_on_exit(release_synthesis_lock):
+                with _track_synthesis_request(
+                    route="tts:stream",
+                    model_id=spec.id,
+                    text_chars=len(req.text),
+                    chunk_count=len(chunks),
+                ):
+                    _update_active_request(phase="loading_runtime")
+                    runtime, reloaded = RUNTIME_CACHE.get(key)
+                    _ensure_lora_adapter_for_request(runtime, spec, key)
 
-                LOGGER.info(
-                    "[tts:stream] split model_id=%s mode=%s auto_split=%s chunks=%d max_chunk_chars=%d",
-                    spec.id,
-                    f"{spec.mode}:{key.lora_load_mode}" if spec.lora_adapter else spec.mode,
-                    req.auto_split,
-                    len(chunks),
-                    req.max_chunk_chars,
-                )
-
-                sample_rate: int | None = None
-                channels: int | None = None
-                used_seeds: list[int | None] = []
-                ref_wav, ref_latent = _resolve_reference_inputs(spec, req)
-                for index, (chunk, seconds) in enumerate(zip(chunks, chunk_seconds, strict=True), start=1):
-                    chunk_seed = None if req.seed is None else req.seed + index - 1
                     LOGGER.info(
-                        "[tts:stream] chunk %d/%d chars=%d seconds=%s seed=%s text=%r",
-                        index,
+                        "[tts:stream] split model_id=%s mode=%s auto_split=%s chunks=%d max_chunk_chars=%d",
+                        spec.id,
+                        _format_effective_mode(spec, key),
+                        req.auto_split,
                         len(chunks),
-                        len(chunk),
-                        _format_seconds_header(seconds),
-                        "random" if chunk_seed is None else chunk_seed,
-                        _preview_chunk(chunk),
+                        req.max_chunk_chars,
                     )
-                    result = runtime.synthesize(
-                        SamplingRequest(
-                            text=chunk,
-                            ref_wav=ref_wav,
-                            ref_latent=ref_latent,
-                            no_ref=False,
-                            ref_normalize_db=-16.0,
-                            ref_ensure_max=True,
-                            num_candidates=1,
-                            decode_mode="sequential",
-                            seconds=seconds,
-                            duration_scale=req.duration_scale,
-                            min_seconds=req.min_seconds,
-                            max_seconds=req.max_seconds,
-                            max_ref_seconds=30.0,
-                            max_text_len=None,
-                            num_steps=req.num_steps,
-                            t_schedule_mode=req.t_schedule_mode,
-                            sway_coeff=req.sway_coeff,
-                            seed=chunk_seed,
-                            cfg_guidance_mode="independent",
-                            cfg_scale_text=req.cfg_scale_text,
-                            cfg_scale_speaker=req.cfg_scale_speaker,
-                            speaker_kv_scale=req.speaker_kv_scale,
-                            speaker_kv_min_t=req.speaker_kv_min_t,
-                            speaker_kv_max_layers=req.speaker_kv_max_layers,
-                            trim_tail=req.trim_tail,
+
+                    sample_rate: int | None = None
+                    channels: int | None = None
+                    used_seeds: list[int | None] = []
+                    ref_wav, ref_latent = _resolve_reference_inputs(spec, req)
+                    for index, (chunk, seconds) in enumerate(
+                        zip(chunks, chunk_seconds, strict=True),
+                        start=1,
+                    ):
+                        if stop_event.is_set():
+                            LOGGER.warning(
+                                "[tts:stream] cancelled_before_chunk model_id=%s chunk=%d/%d",
+                                spec.id,
+                                index,
+                                len(chunks),
+                            )
+                            return
+                        _update_active_request(
+                            phase="synthesizing",
+                            chunk_index=index,
+                            chunk_batch_end=index,
                         )
-                    )
-                    used_seeds.append(result.used_seed)
-                    audio = _audio_to_channels_first(result.audio)
-                    if sample_rate is None:
-                        sample_rate = result.sample_rate
-                        channels = int(audio.shape[0])
-                        proc = _start_mp3_stream_process(sample_rate, channels)
-                        reader = threading.Thread(target=read_stdout, args=(proc,), daemon=True)
-                        reader.start()
-                    elif sample_rate != result.sample_rate:
-                        raise ValueError("Generated chunks have different sample rates")
+                        chunk_seed = None if req.seed is None else req.seed + index - 1
+                        LOGGER.info(
+                            "[tts:stream] chunk %d/%d chars=%d seconds=%s seed=%s text=%r",
+                            index,
+                            len(chunks),
+                            len(chunk),
+                            _format_seconds_header(seconds),
+                            "random" if chunk_seed is None else chunk_seed,
+                            _preview_chunk(chunk),
+                        )
+                        result = runtime.synthesize(
+                            SamplingRequest(
+                                text=chunk,
+                                ref_wav=ref_wav,
+                                ref_latent=ref_latent,
+                                no_ref=False,
+                                ref_normalize_db=-16.0,
+                                ref_ensure_max=True,
+                                num_candidates=1,
+                                decode_mode="sequential",
+                                seconds=seconds,
+                                duration_scale=req.duration_scale,
+                                min_seconds=req.min_seconds,
+                                max_seconds=req.max_seconds,
+                                max_ref_seconds=30.0,
+                                max_text_len=None,
+                                num_steps=req.num_steps,
+                                t_schedule_mode=req.t_schedule_mode,
+                                sway_coeff=req.sway_coeff,
+                                seed=chunk_seed,
+                                cfg_guidance_mode="independent",
+                                cfg_scale_text=req.cfg_scale_text,
+                                cfg_scale_speaker=req.cfg_scale_speaker,
+                                speaker_kv_scale=req.speaker_kv_scale,
+                                speaker_kv_min_t=req.speaker_kv_min_t,
+                                speaker_kv_max_layers=req.speaker_kv_max_layers,
+                                trim_tail=req.trim_tail,
+                                lora_adapter=_sampling_request_lora_adapter(spec, key),
+                            )
+                        )
+                        if stop_event.is_set():
+                            LOGGER.warning(
+                                "[tts:stream] cancelled_after_synthesize model_id=%s chunk=%d/%d",
+                                spec.id,
+                                index,
+                                len(chunks),
+                            )
+                            return
+                        used_seeds.append(result.used_seed)
+                        audio = _audio_to_channels_first(result.audio)
+                        if sample_rate is None:
+                            sample_rate = result.sample_rate
+                            channels = int(audio.shape[0])
+                            proc = _start_mp3_stream_process(sample_rate, channels)
+                            set_active_proc(proc)
+                            reader = threading.Thread(target=read_stdout, args=(proc,), daemon=True)
+                            reader.start()
+                        elif sample_rate != result.sample_rate:
+                            raise ValueError("Generated chunks have different sample rates")
 
-                    if channels is None or audio.shape[0] != channels:
-                        raise ValueError("Generated chunks have different channel counts")
-                    if proc is None or proc.stdin is None:
-                        raise RuntimeError("MP3 stream encoder is not available")
+                        if channels is None or audio.shape[0] != channels:
+                            raise ValueError("Generated chunks have different channel counts")
+                        if proc is None or proc.stdin is None:
+                            raise RuntimeError("MP3 stream encoder is not available")
 
-                    proc.stdin.write(_channels_first_to_pcm_s16le_bytes(audio))
-                    proc.stdin.write(
-                        _silence_pcm_s16le_bytes(channels, sample_rate, req.chunk_tail_padding_ms)
-                    )
-                    if index < len(chunks):
+                        proc.stdin.write(_channels_first_to_pcm_s16le_bytes(audio))
                         proc.stdin.write(
-                            _silence_pcm_s16le_bytes(channels, sample_rate, req.chunk_silence_ms)
+                            _silence_pcm_s16le_bytes(
+                                channels,
+                                sample_rate,
+                                req.chunk_tail_padding_ms,
+                            )
                         )
-                    proc.stdin.flush()
+                        if index < len(chunks):
+                            proc.stdin.write(
+                                _silence_pcm_s16le_bytes(
+                                    channels,
+                                    sample_rate,
+                                    req.chunk_silence_ms,
+                                )
+                            )
+                        proc.stdin.flush()
 
-                if proc is None:
-                    raise ValueError("No audio segments were generated")
-                if proc.stdin is not None:
-                    proc.stdin.close()
-                stderr = b""
-                if proc.stderr is not None:
-                    stderr = proc.stderr.read()
-                return_code = proc.wait()
-                if return_code != 0:
-                    raise RuntimeError(stderr.decode("utf-8", errors="replace"))
-                LOGGER.info(
-                    "[tts:stream] complete model_id=%s chunks=%d seeds=%s reloaded=%s generation_sec=%.1f",
-                    spec.id,
-                    len(chunks),
-                    ",".join(str(seed) for seed in used_seeds),
-                    reloaded,
-                    time.perf_counter() - request_started_at,
-                )
+                    if proc is None:
+                        raise ValueError("No audio segments were generated")
+                    _update_active_request(phase="encoding")
+                    if proc.stdin is not None:
+                        proc.stdin.close()
+                    stderr = b""
+                    if proc.stderr is not None:
+                        stderr = proc.stderr.read()
+                    return_code = proc.wait()
+                    if return_code != 0:
+                        raise RuntimeError(stderr.decode("utf-8", errors="replace"))
+                    LOGGER.info(
+                        "[tts:stream] complete model_id=%s chunks=%d seeds=%s reloaded=%s generation_sec=%.1f",
+                        spec.id,
+                        len(chunks),
+                        ",".join(str(seed) for seed in used_seeds),
+                        reloaded,
+                        time.perf_counter() - request_started_at,
+                    )
         except Exception:
             LOGGER.exception(
                 "[tts:stream] failed model_id=%s generation_sec=%.1f",
@@ -891,27 +1151,92 @@ def _iter_mp3_stream(
                 proc.kill()
             if reader is None:
                 put_end()
+        finally:
+            set_active_proc(None)
 
     worker = threading.Thread(target=generate_and_encode, daemon=True)
     worker.start()
-    while True:
-        item = output_queue.get()
-        if item is _STREAM_END:
-            break
-        yield item
-    worker.join(timeout=1.0)
+    try:
+        while True:
+            try:
+                item = output_queue.get(timeout=0.5)
+            except queue.Empty:
+                if not worker.is_alive():
+                    break
+                continue
+            if item is _STREAM_END:
+                break
+            yield item
+    finally:
+        stop_event.set()
+        kill_active_proc()
+        worker.join(timeout=1.0)
+        if worker.is_alive():
+            LOGGER.warning(
+                "[tts:stream] generator_closed_worker_still_running model_id=%s age_sec=%.1f",
+                spec.id,
+                time.perf_counter() - request_started_at,
+            )
 
 
-def _validate_model_assets(spec: ModelSpec) -> None:
+def _request_uses_lora(spec: ModelSpec, req: TTSRequest) -> bool:
+    if not req.use_lora:
+        return False
+    if spec.lora_adapter is None:
+        raise HTTPException(status_code=400, detail=f"LoRA adapter is not configured: {spec.id}")
+    return True
+
+
+def _format_effective_mode(spec: ModelSpec, key: RuntimeKey) -> str:
+    if key.lora_load_mode != "none":
+        return f"lora:{key.lora_load_mode}"
+    return spec.mode
+
+
+def _sampling_request_lora_adapter(spec: ModelSpec, key: RuntimeKey) -> str | None:
+    if key.lora_load_mode in {"dynamic", "reload"}:
+        return spec.lora_adapter
+    return None
+
+
+def _ensure_lora_adapter_for_request(
+    runtime: InferenceRuntime,
+    spec: ModelSpec,
+    key: RuntimeKey,
+) -> None:
+    if spec.lora_adapter is None or key.lora_load_mode == "none":
+        return
+    if key.lora_load_mode == "delta":
+        runtime.ensure_lora_delta_adapter(
+            adapter_name=spec.id,
+            adapter_path=spec.lora_adapter,
+        )
+    elif key.lora_load_mode in {"dynamic", "reload"}:
+        runtime.ensure_lora_adapter(
+            adapter_name=spec.id,
+            adapter_path=spec.lora_adapter,
+            replace_existing=True,
+        )
+
+
+def _validate_model_assets(spec: ModelSpec, *, use_lora: bool = False) -> None:
     if not Path(spec.checkpoint).is_file():
         raise HTTPException(status_code=503, detail=f"Checkpoint not found: {spec.checkpoint}")
-    if spec.lora_adapter is not None and not is_lora_adapter_dir(spec.lora_adapter):
+    if use_lora and spec.lora_adapter is not None and not is_lora_adapter_dir(spec.lora_adapter):
         raise HTTPException(
             status_code=503,
             detail=f"LoRA adapter not found or invalid: {spec.lora_adapter}",
         )
-    if not Path(spec.ref_wav).is_file():
-        raise HTTPException(status_code=503, detail=f"Reference wav not found: {spec.ref_wav}")
+    has_ref_wav = spec.ref_wav is not None and Path(spec.ref_wav).is_file()
+    has_ref_latent = spec.ref_latent is not None and Path(spec.ref_latent).is_file()
+    if not has_ref_wav and not has_ref_latent:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Reference asset not found: "
+                f"ref_wav={spec.ref_wav!r}, ref_latent={spec.ref_latent!r}"
+            ),
+        )
 
 
 REGISTRY = ModelRegistry.from_env()
@@ -919,6 +1244,237 @@ RUNTIME_CACHE = RuntimeCache(max_items=int(os.getenv("IRODORI_MAX_CACHED_RUNTIME
 
 app = FastAPI(title="Irodori-TTS Multi-Model API", version="0.2.0")
 _synthesis_lock = threading.Lock()
+_active_request_lock = threading.Lock()
+_active_request: dict[str, Any] | None = None
+_active_request_seq = 0
+
+
+def _synthesis_busy() -> bool:
+    return _synthesis_lock.locked()
+
+
+def _worker_id() -> str | None:
+    for key in ("RUNPOD_WORKER_ID", "RUNPOD_POD_ID", "HOSTNAME"):
+        value = os.getenv(key)
+        if value:
+            return value
+    return None
+
+
+def _busy_retry_after_seconds() -> str:
+    raw = os.getenv("IRODORI_BUSY_RETRY_AFTER_SECONDS", "1")
+    try:
+        parsed = int(raw)
+    except ValueError:
+        parsed = 1
+    return str(max(parsed, 1))
+
+
+def _busy_wait_timeout_seconds() -> float:
+    return _env_float("IRODORI_BUSY_WAIT_TIMEOUT_SECONDS", 30.0, minimum=0.0)
+
+
+def _max_request_seconds() -> float:
+    return _env_float("IRODORI_MAX_REQUEST_SECONDS", 0.0, minimum=0.0)
+
+
+def _ping_fails_when_busy() -> bool:
+    return _env_bool("IRODORI_PING_FAILS_WHEN_BUSY", False)
+
+
+def _new_request_id(route: str) -> str:
+    global _active_request_seq
+    with _active_request_lock:
+        _active_request_seq += 1
+        sequence = _active_request_seq
+    worker_id = _worker_id() or "local"
+    normalized_route = route.replace(":", "-").replace("/", "-").strip("-") or "request"
+    return f"{worker_id}-{normalized_route}-{sequence}"
+
+
+def _active_request_payload() -> dict[str, Any] | None:
+    with _active_request_lock:
+        if _active_request is None:
+            return None
+        payload = dict(_active_request)
+    payload["age_seconds"] = round(time.perf_counter() - float(payload["started_at_perf"]), 3)
+    return payload
+
+
+def _set_active_request(
+    *,
+    request_id: str,
+    route: str,
+    model_id: str | None,
+    text_chars: int,
+    chunk_count: int | None,
+) -> None:
+    global _active_request
+    with _active_request_lock:
+        _active_request = {
+            "request_id": request_id,
+            "route": route,
+            "model_id": model_id,
+            "worker_id": _worker_id(),
+            "text_chars": text_chars,
+            "chunk_count": chunk_count,
+            "chunk_index": None,
+            "phase": "started",
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "started_at_perf": time.perf_counter(),
+        }
+
+
+def _update_active_request(**updates: Any) -> None:
+    with _active_request_lock:
+        if _active_request is not None:
+            _active_request.update(updates)
+
+
+def _clear_active_request(request_id: str) -> None:
+    global _active_request
+    with _active_request_lock:
+        if _active_request is not None and _active_request.get("request_id") == request_id:
+            _active_request = None
+
+
+@contextmanager
+def _track_synthesis_request(
+    *,
+    route: str,
+    model_id: str | None,
+    text_chars: int,
+    chunk_count: int | None,
+) -> Iterator[str]:
+    request_id = _new_request_id(route)
+    _set_active_request(
+        request_id=request_id,
+        route=route,
+        model_id=model_id,
+        text_chars=text_chars,
+        chunk_count=chunk_count,
+    )
+    max_seconds = _max_request_seconds()
+    timer: threading.Timer | None = None
+    if max_seconds > 0:
+
+        def kill_overdue_request() -> None:
+            payload = _active_request_payload()
+            LOGGER.critical(
+                "[tts] request_watchdog_exit max_seconds=%.1f active_request=%s",
+                max_seconds,
+                payload,
+            )
+            logging.shutdown()
+            os._exit(_env_int("IRODORI_MAX_REQUEST_EXIT_CODE", 124, minimum=1))
+
+        timer = threading.Timer(max_seconds, kill_overdue_request)
+        timer.daemon = True
+        timer.start()
+    try:
+        yield request_id
+    finally:
+        if timer is not None:
+            timer.cancel()
+        _clear_active_request(request_id)
+
+
+def _worker_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
+    headers = dict(extra or {})
+    worker_id = _worker_id()
+    if worker_id:
+        headers["X-Irodori-Worker-Id"] = worker_id
+    return headers
+
+
+def _busy_headers() -> dict[str, str]:
+    return _worker_headers(
+        {
+            "Retry-After": _busy_retry_after_seconds(),
+            "X-Irodori-Busy": "1",
+            "X-Irodori-Busy-Wait-Timeout": f"{_busy_wait_timeout_seconds():g}",
+        }
+    )
+
+
+def _raise_worker_busy(route: str, model_id: str | None) -> None:
+    LOGGER.warning("[tts] busy route=%s model_id=%s worker_id=%s", route, model_id, _worker_id())
+    raise HTTPException(
+        status_code=503,
+        detail="TTS worker is busy. Retry this request on another worker.",
+        headers=_busy_headers(),
+    )
+
+
+def _model_assets_ready_rows() -> tuple[bool, list[dict[str, Any]]]:
+    rows = REGISTRY.list_models()
+    enabled = [row for row in rows if row["enabled"]]
+    ready = all(
+        row["checkpoint_exists"]
+        and (row["ref_wav_exists"] or row["ref_latent_exists"])
+        and (row["lora_adapter_exists"] is not False)
+        for row in enabled
+    )
+    return ready, rows
+
+
+def _readiness_payload() -> dict[str, Any]:
+    assets_ready, rows = _model_assets_ready_rows()
+    busy = _synthesis_busy()
+    return {
+        "ready": assets_ready and not busy,
+        "assets_ready": assets_ready,
+        "busy": busy,
+        "active_request": _active_request_payload(),
+        "worker_id": _worker_id(),
+        "models": rows,
+        "cache": RUNTIME_CACHE.keys(),
+    }
+
+
+def _acquire_synthesis_lock(route: str, model_id: str | None) -> None:
+    if _synthesis_lock.acquire(blocking=False):
+        return
+
+    wait_timeout = _busy_wait_timeout_seconds()
+    if wait_timeout <= 0:
+        _raise_worker_busy(route, model_id)
+
+    started_at = time.perf_counter()
+    LOGGER.warning(
+        "[tts] busy_wait route=%s model_id=%s worker_id=%s timeout_sec=%.1f",
+        route,
+        model_id,
+        _worker_id(),
+        wait_timeout,
+    )
+    if not _synthesis_lock.acquire(timeout=wait_timeout):
+        _raise_worker_busy(route, model_id)
+    LOGGER.info(
+        "[tts] busy_wait_acquired route=%s model_id=%s worker_id=%s waited_sec=%.3f",
+        route,
+        model_id,
+        _worker_id(),
+        time.perf_counter() - started_at,
+    )
+
+
+@contextmanager
+def _release_synthesis_lock_on_exit(enabled: bool) -> Iterator[None]:
+    try:
+        yield
+    finally:
+        if enabled:
+            _synthesis_lock.release()
+
+
+@contextmanager
+def _try_synthesis_lock(route: str, model_id: str | None) -> Iterator[None]:
+    _acquire_synthesis_lock(route, model_id)
+    try:
+        yield
+    finally:
+        _synthesis_lock.release()
 
 
 @app.on_event("startup")
@@ -928,41 +1484,46 @@ def preload_models() -> None:
     for spec in REGISTRY.models.values():
         if not spec.enabled or not spec.preload:
             continue
-        _validate_model_assets(spec)
-        runtime, _ = RUNTIME_CACHE.get(build_runtime_key(spec))
-        lora_mode = _lora_load_mode()
-        if spec.lora_adapter is not None and lora_mode == "delta":
-            runtime.ensure_lora_delta_adapter(adapter_name=spec.id, adapter_path=spec.lora_adapter)
-        elif spec.lora_adapter is not None and lora_mode in {"dynamic", "reload"}:
-            runtime.ensure_lora_adapter(
-                adapter_name=spec.id,
-                adapter_path=spec.lora_adapter,
-                replace_existing=True,
-            )
+        _validate_model_assets(spec, use_lora=False)
+        RUNTIME_CACHE.get(build_runtime_key(spec, use_lora=False))
+
+
+@app.get("/ping")
+async def ping() -> Response:
+    if _ping_fails_when_busy() and _synthesis_busy():
+        return Response(status_code=503, headers=_busy_headers())
+    return Response(
+        status_code=200,
+        headers=_worker_headers({"X-Irodori-Busy": "1" if _synthesis_busy() else "0"}),
+    )
 
 
 @app.get("/health")
-def health() -> dict[str, Any]:
+async def health() -> dict[str, Any]:
     return {
         "ok": True,
         "default_model_id": REGISTRY.default_model_id,
         "enabled_models": len([spec for spec in REGISTRY.models.values() if spec.enabled]),
+        "worker_id": _worker_id(),
+        "busy": _synthesis_busy(),
+        "active_request": _active_request_payload(),
+        "busy_wait_timeout_seconds": _busy_wait_timeout_seconds(),
+        "max_request_seconds": _max_request_seconds(),
     }
 
 
 @app.get("/readyz")
-def readyz() -> dict[str, Any]:
-    rows = REGISTRY.list_models()
-    enabled = [row for row in rows if row["enabled"]]
-    ready = all(
-        row["checkpoint_exists"]
-        and row["ref_wav_exists"]
-        and (row["lora_adapter_exists"] is not False)
-        for row in enabled
-    )
-    if not ready:
-        raise HTTPException(status_code=503, detail={"ready": False, "models": rows})
-    return {"ready": True, "models": rows, "cache": RUNTIME_CACHE.keys()}
+async def readyz() -> dict[str, Any]:
+    payload = _readiness_payload()
+    if not payload["ready"]:
+        headers = _busy_headers() if payload["busy"] else _worker_headers()
+        raise HTTPException(status_code=503, detail=payload, headers=headers)
+    return payload
+
+
+@app.get("/ready")
+async def ready() -> dict[str, Any]:
+    return await readyz()
 
 
 @app.get("/v1/models")
@@ -988,115 +1549,132 @@ def tts(req: TTSRequest) -> Response:
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"Unknown model_id: {req.model_id}") from exc
 
-    _validate_model_assets(spec)
-    key = build_runtime_key(spec)
+    use_lora = _request_uses_lora(spec, req)
+    _validate_model_assets(spec, use_lora=use_lora)
+    key = build_runtime_key(spec, use_lora=use_lora)
 
     try:
-        with _synthesis_lock:
-            runtime, reloaded = RUNTIME_CACHE.get(key)
-            if spec.lora_adapter is not None and key.lora_load_mode == "delta":
-                runtime.ensure_lora_delta_adapter(
-                    adapter_name=spec.id,
-                    adapter_path=spec.lora_adapter,
-                )
-            elif spec.lora_adapter is not None and key.lora_load_mode in {"dynamic", "reload"}:
-                runtime.ensure_lora_adapter(
-                    adapter_name=spec.id,
-                    adapter_path=spec.lora_adapter,
-                    replace_existing=True,
-                )
-            chunks = _prepare_tts_chunks(req.text, req.max_chunk_chars, req.auto_split)
-            if not chunks:
-                raise ValueError("text is empty after splitting")
+        with _try_synthesis_lock("tts", spec.id):
+            with _track_synthesis_request(
+                route="tts",
+                model_id=spec.id,
+                text_chars=len(req.text),
+                chunk_count=None,
+            ):
+                chunks = _prepare_tts_chunks(req.text, req.max_chunk_chars, req.auto_split)
+                if not chunks:
+                    raise ValueError("text is empty after splitting")
 
-            audios: list[torch.Tensor] = []
-            used_seeds: list[int | None] = []
-            sample_rate: int | None = None
-            resolved_chunk_seconds = _resolve_chunk_seconds(req)
-            chunk_seconds: list[float | None] = [resolved_chunk_seconds for _chunk in chunks]
-            ref_wav, ref_latent = _resolve_reference_inputs(spec, req)
-            LOGGER.info(
-                "[tts] split model_id=%s mode=%s auto_split=%s chunks=%d max_chunk_chars=%d",
-                spec.id,
-                f"{spec.mode}:{key.lora_load_mode}" if spec.lora_adapter else spec.mode,
-                req.auto_split,
-                len(chunks),
-                req.max_chunk_chars,
-            )
-            for index, (chunk, seconds) in enumerate(zip(chunks, chunk_seconds, strict=True), start=1):
+                resolved_chunk_seconds = _resolve_chunk_seconds(req)
+                _validate_request_limits(
+                    req,
+                    chunks=chunks,
+                    resolved_chunk_seconds=resolved_chunk_seconds,
+                )
+                chunk_seconds: list[float | None] = [resolved_chunk_seconds for _chunk in chunks]
+                _update_active_request(chunk_count=len(chunks), phase="loading_runtime")
+
+                runtime, reloaded = RUNTIME_CACHE.get(key)
+                _ensure_lora_adapter_for_request(runtime, spec, key)
+
+                audios: list[torch.Tensor] = []
+                used_seeds: list[int | None] = []
+                sample_rate: int | None = None
+                ref_wav, ref_latent = _resolve_reference_inputs(spec, req)
                 LOGGER.info(
-                    "[tts] chunk %d/%d chars=%d seconds=%s seed=%s text=%r",
-                    index,
+                    "[tts] split model_id=%s mode=%s auto_split=%s chunks=%d max_chunk_chars=%d",
+                    spec.id,
+                    _format_effective_mode(spec, key),
+                    req.auto_split,
                     len(chunks),
-                    len(chunk),
-                    _format_seconds_header(seconds),
-                    "random" if req.seed is None else req.seed + index - 1,
-                    _preview_chunk(chunk),
+                    req.max_chunk_chars,
                 )
-
-            auto_duration = any(seconds is None for seconds in chunk_seconds)
-            chunk_batch_size = 1 if auto_duration else min(_chunk_batch_size(), len(chunks))
-            LOGGER.info("[tts] chunk_batch_size=%d", chunk_batch_size)
-            for batch_start in range(0, len(chunks), chunk_batch_size):
-                batch_end = min(len(chunks), batch_start + chunk_batch_size)
-                batch_reqs: list[SamplingRequest] = []
-                for index in range(batch_start, batch_end):
-                    chunk_seed = None if req.seed is None else req.seed + index
-                    batch_reqs.append(
-                        SamplingRequest(
-                            text=chunks[index],
-                            ref_wav=ref_wav,
-                            ref_latent=ref_latent,
-                            no_ref=False,
-                            ref_normalize_db=-16.0,
-                            ref_ensure_max=True,
-                            num_candidates=1,
-                            decode_mode="batch" if batch_end - batch_start > 1 else "sequential",
-                            seconds=chunk_seconds[index],
-                            duration_scale=req.duration_scale,
-                            min_seconds=req.min_seconds,
-                            max_seconds=req.max_seconds,
-                            max_ref_seconds=30.0,
-                            max_text_len=None,
-                            num_steps=req.num_steps,
-                            t_schedule_mode=req.t_schedule_mode,
-                            sway_coeff=req.sway_coeff,
-                            seed=chunk_seed,
-                            cfg_guidance_mode="independent",
-                            cfg_scale_text=req.cfg_scale_text,
-                            cfg_scale_speaker=req.cfg_scale_speaker,
-                            speaker_kv_scale=req.speaker_kv_scale,
-                            speaker_kv_min_t=req.speaker_kv_min_t,
-                            speaker_kv_max_layers=req.speaker_kv_max_layers,
-                            trim_tail=req.trim_tail,
-                        )
+                for index, (chunk, seconds) in enumerate(
+                    zip(chunks, chunk_seconds, strict=True),
+                    start=1,
+                ):
+                    LOGGER.info(
+                        "[tts] chunk %d/%d chars=%d seconds=%s seed=%s text=%r",
+                        index,
+                        len(chunks),
+                        len(chunk),
+                        _format_seconds_header(seconds),
+                        "random" if req.seed is None else req.seed + index - 1,
+                        _preview_chunk(chunk),
                     )
-                if auto_duration:
-                    results = [runtime.synthesize(batch_req) for batch_req in batch_reqs]
-                else:
-                    results = runtime.synthesize_batch(batch_reqs)
-                for result in results:
-                    if sample_rate is None:
-                        sample_rate = result.sample_rate
-                    elif sample_rate != result.sample_rate:
-                        raise ValueError("Generated chunks have different sample rates")
-                    audios.append(result.audio)
-                    used_seeds.append(result.used_seed)
 
-            assert sample_rate is not None
-            audio = _concat_audio_segments(
-                audios,
-                sample_rate,
-                req.chunk_silence_ms,
-                req.chunk_tail_padding_ms,
-            )
-            wav_bytes = _audio_to_wav_bytes(audio, sample_rate)
-            if req.format == "mp3":
-                body = _wav_to_mp3_bytes(wav_bytes)
-                media_type = "audio/mpeg"
-            else:
-                body = wav_bytes
-                media_type = "audio/wav"
+                auto_duration = any(seconds is None for seconds in chunk_seconds)
+                chunk_batch_size = 1 if auto_duration else min(_chunk_batch_size(), len(chunks))
+                LOGGER.info("[tts] chunk_batch_size=%d", chunk_batch_size)
+                for batch_start in range(0, len(chunks), chunk_batch_size):
+                    batch_end = min(len(chunks), batch_start + chunk_batch_size)
+                    _update_active_request(
+                        phase="synthesizing",
+                        chunk_index=batch_start + 1,
+                        chunk_batch_end=batch_end,
+                    )
+                    batch_reqs: list[SamplingRequest] = []
+                    for index in range(batch_start, batch_end):
+                        chunk_seed = None if req.seed is None else req.seed + index
+                        batch_reqs.append(
+                            SamplingRequest(
+                                text=chunks[index],
+                                ref_wav=ref_wav,
+                                ref_latent=ref_latent,
+                                no_ref=False,
+                                ref_normalize_db=-16.0,
+                                ref_ensure_max=True,
+                                num_candidates=1,
+                                decode_mode="batch" if batch_end - batch_start > 1 else "sequential",
+                                seconds=chunk_seconds[index],
+                                duration_scale=req.duration_scale,
+                                min_seconds=req.min_seconds,
+                                max_seconds=req.max_seconds,
+                                max_ref_seconds=30.0,
+                                max_text_len=None,
+                                num_steps=req.num_steps,
+                                t_schedule_mode=req.t_schedule_mode,
+                                sway_coeff=req.sway_coeff,
+                                seed=chunk_seed,
+                                cfg_guidance_mode="independent",
+                                cfg_scale_text=req.cfg_scale_text,
+                                cfg_scale_speaker=req.cfg_scale_speaker,
+                                speaker_kv_scale=req.speaker_kv_scale,
+                                speaker_kv_min_t=req.speaker_kv_min_t,
+                                speaker_kv_max_layers=req.speaker_kv_max_layers,
+                                trim_tail=req.trim_tail,
+                                lora_adapter=_sampling_request_lora_adapter(spec, key),
+                            )
+                        )
+                    if auto_duration:
+                        results = [runtime.synthesize(batch_req) for batch_req in batch_reqs]
+                    else:
+                        results = runtime.synthesize_batch(batch_reqs)
+                    for result in results:
+                        if sample_rate is None:
+                            sample_rate = result.sample_rate
+                        elif sample_rate != result.sample_rate:
+                            raise ValueError("Generated chunks have different sample rates")
+                        audios.append(result.audio)
+                        used_seeds.append(result.used_seed)
+
+                _update_active_request(phase="encoding")
+                assert sample_rate is not None
+                audio = _concat_audio_segments(
+                    audios,
+                    sample_rate,
+                    req.chunk_silence_ms,
+                    req.chunk_tail_padding_ms,
+                )
+                wav_bytes = _audio_to_wav_bytes(audio, sample_rate)
+                if req.format == "mp3":
+                    body = _wav_to_mp3_bytes(wav_bytes)
+                    media_type = "audio/mpeg"
+                else:
+                    body = wav_bytes
+                    media_type = "audio/wav"
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
@@ -1113,8 +1691,9 @@ def tts(req: TTSRequest) -> Response:
     )
     headers = {
         "X-Irodori-Model-Id": spec.id,
-        "X-Irodori-Model-Mode": spec.mode,
+        "X-Irodori-Model-Mode": _format_effective_mode(spec, key),
         "X-Irodori-Lora-Load-Mode": key.lora_load_mode,
+        "X-Irodori-Use-Lora": "1" if use_lora else "0",
         "X-Irodori-Seed": str(used_seeds[0]),
         "X-Irodori-Seeds": ",".join(str(seed) for seed in used_seeds),
         "X-Irodori-Num-Steps": str(req.num_steps),
@@ -1137,6 +1716,7 @@ def tts(req: TTSRequest) -> Response:
         "X-Irodori-Trim-Tail": "1" if req.trim_tail else "0",
         "X-Irodori-Runtime-Reloaded": "1" if reloaded else "0",
     }
+    headers.update(_worker_headers())
     return Response(content=body, media_type=media_type, headers=headers)
 
 
@@ -1147,13 +1727,19 @@ def tts_stream(req: TTSRequest) -> StreamingResponse:
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=f"Unknown model_id: {req.model_id}") from exc
 
-    _validate_model_assets(spec)
-    key = build_runtime_key(spec)
+    use_lora = _request_uses_lora(spec, req)
+    _validate_model_assets(spec, use_lora=use_lora)
+    key = build_runtime_key(spec, use_lora=use_lora)
     try:
         chunks = _prepare_tts_chunks(req.text, req.max_chunk_chars, req.auto_split)
         if not chunks:
             raise ValueError("text is empty after splitting")
         resolved_chunk_seconds = _resolve_chunk_seconds(req)
+        _validate_request_limits(
+            req,
+            chunks=chunks,
+            resolved_chunk_seconds=resolved_chunk_seconds,
+        )
         chunk_seconds = [resolved_chunk_seconds for _chunk in chunks]
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1168,8 +1754,9 @@ def tts_stream(req: TTSRequest) -> StreamingResponse:
         "Cache-Control": "no-store",
         "X-Irodori-Stream-Mode": "ffmpeg-pcm-mp3",
         "X-Irodori-Model-Id": spec.id,
-        "X-Irodori-Model-Mode": spec.mode,
+        "X-Irodori-Model-Mode": _format_effective_mode(spec, key),
         "X-Irodori-Lora-Load-Mode": key.lora_load_mode,
+        "X-Irodori-Use-Lora": "1" if use_lora else "0",
         "X-Irodori-Seed": seed_header,
         "X-Irodori-Seeds": seeds_header,
         "X-Irodori-Num-Steps": str(req.num_steps),
@@ -1190,8 +1777,21 @@ def tts_stream(req: TTSRequest) -> StreamingResponse:
         "X-Irodori-Max-Seconds": str(req.max_seconds),
         "X-Irodori-Trim-Tail": "1" if req.trim_tail else "0",
     }
-    return StreamingResponse(
-        _iter_mp3_stream(spec, key, req, chunks, chunk_seconds),
-        media_type="audio/mpeg",
-        headers=headers,
-    )
+    headers.update(_worker_headers())
+    _acquire_synthesis_lock("tts:stream", spec.id)
+    try:
+        return StreamingResponse(
+            _iter_mp3_stream(
+                spec,
+                key,
+                req,
+                chunks,
+                chunk_seconds,
+                release_synthesis_lock=True,
+            ),
+            media_type="audio/mpeg",
+            headers=headers,
+        )
+    except Exception:
+        _synthesis_lock.release()
+        raise
