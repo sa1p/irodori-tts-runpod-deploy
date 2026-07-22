@@ -1493,13 +1493,14 @@ class InferenceRuntime:
         req = reqs[0]
         batch_size = len(reqs)
         common_fields = (
-            "ref_wav",
-            "ref_latent",
             "no_ref",
             "ref_normalize_db",
             "ref_ensure_max",
             "decode_mode",
             "seconds",
+            "duration_scale",
+            "min_seconds",
+            "max_seconds",
             "max_ref_seconds",
             "max_text_len",
             "max_caption_len",
@@ -1524,6 +1525,7 @@ class InferenceRuntime:
             "tail_window_size",
             "tail_std_threshold",
             "tail_mean_threshold",
+            "lora_adapter",
         )
         for other in reqs[1:]:
             for field in common_fields:
@@ -1531,10 +1533,19 @@ class InferenceRuntime:
                     raise ValueError(f"Batch chunk requests must share {field}.")
 
         messages: list[str] = []
-        if req.seconds is None:
-            raise ValueError("synthesize_batch requires manual seconds; use synthesize for auto duration.")
-        if req.seconds <= 0:
+        if req.seconds is not None and req.seconds <= 0:
             raise ValueError(f"seconds must be > 0, got {req.seconds}")
+        duration_scale = float(req.duration_scale)
+        if duration_scale <= 0:
+            raise ValueError(f"duration_scale must be > 0, got {duration_scale}")
+        min_seconds = float(req.min_seconds)
+        max_seconds = float(req.max_seconds)
+        if min_seconds <= 0:
+            raise ValueError(f"min_seconds must be > 0, got {min_seconds}")
+        if max_seconds < min_seconds:
+            raise ValueError(
+                f"max_seconds must be >= min_seconds, got min={min_seconds} max={max_seconds}"
+            )
         decode_mode = str(req.decode_mode).strip().lower()
         if decode_mode not in {"sequential", "batch"}:
             raise ValueError(
@@ -1666,32 +1677,153 @@ class InferenceRuntime:
                 caption_ids = caption_ids.to(self.model_device)
                 caption_mask = caption_mask.to(self.model_device)
 
-            target_samples = int(float(req.seconds) * self.codec.sample_rate)
-            latent_steps = math.ceil(target_samples / int(self.codec.model.hop_length))
-            patched_steps = math.ceil(latent_steps / self.model_cfg.latent_patch_size)
-
-            if isinstance(self.train_cfg, dict):
-                fixed_steps = self.train_cfg.get("fixed_target_latent_steps")
-                if isinstance(fixed_steps, int) and fixed_steps > 0 and latent_steps > fixed_steps:
-                    msg = (
-                        f"warning: requested latent length ({latent_steps}) exceeds fixed_target_latent_steps ({fixed_steps}) "
-                        "used in training. Long-tail stability may degrade."
-                    )
-                    messages.append(msg)
-                    _log(msg)
-
             t0 = _measure_start(self.model_device, self.codec_device)
             msg_count_before_ref = len(messages)
-            ref_latent, ref_mask = self._load_reference_latent(
-                req=req,
-                batch_size=batch_size,
-                messages=messages,
-            )
+            loaded_refs = [
+                self._load_reference_latent(req=item, batch_size=1, messages=messages)
+                for item in reqs
+            ]
+            if loaded_refs[0][0] is None:
+                if any(latent is not None or mask is not None for latent, mask in loaded_refs):
+                    raise ValueError("Batch reference inputs produced incompatible speaker states.")
+                ref_latent = None
+                ref_mask = None
+            else:
+                if any(latent is None or mask is None for latent, mask in loaded_refs):
+                    raise ValueError("Batch reference inputs produced incompatible speaker states.")
+                ref_latent_items = [latent for latent, _mask in loaded_refs if latent is not None]
+                ref_mask_items = [mask for _latent, mask in loaded_refs if mask is not None]
+                max_ref_steps = max(int(latent.shape[1]) for latent in ref_latent_items)
+                ref_dim = int(ref_latent_items[0].shape[2])
+                ref_latent = torch.zeros(
+                    (batch_size, max_ref_steps, ref_dim),
+                    device=self.model_device,
+                    dtype=ref_latent_items[0].dtype,
+                )
+                ref_mask = torch.zeros(
+                    (batch_size, max_ref_steps),
+                    device=self.model_device,
+                    dtype=torch.bool,
+                )
+                for index, (latent, mask) in enumerate(
+                    zip(ref_latent_items, ref_mask_items, strict=True)
+                ):
+                    ref_steps = int(latent.shape[1])
+                    ref_latent[index, :ref_steps] = latent[0]
+                    ref_mask[index, :ref_steps] = mask[0]
             stage_sec = _measure_end(self.model_device, t0, self.codec_device)
             stage_timings.append(("prepare_reference", stage_sec))
             for msg in messages[msg_count_before_ref:]:
                 _log(msg)
             _log(f"[runtime] batch prepare_reference: {stage_sec * 1000.0:.1f} ms")
+
+            hop_length = int(self.codec.model.hop_length)
+            if req.seconds is not None:
+                manual_seconds = float(req.seconds)
+                clamped_seconds = min(max_seconds, max(min_seconds, manual_seconds))
+                if clamped_seconds != manual_seconds:
+                    msg = (
+                        f"warning: manual duration {manual_seconds:.3f}s was clamped to "
+                        f"{clamped_seconds:.3f}s."
+                    )
+                    messages.append(msg)
+                    _log(msg)
+                target_samples_per_item = [
+                    max(1, int(clamped_seconds * self.codec.sample_rate)) for _item in reqs
+                ]
+                latent_steps_per_item = [
+                    math.ceil(target_samples / hop_length)
+                    for target_samples in target_samples_per_item
+                ]
+            elif self.model_cfg.use_duration_predictor:
+                t0 = _measure_start(self.model_device)
+                has_speaker_duration = torch.zeros(
+                    (batch_size,), dtype=torch.bool, device=self.model_device
+                )
+                if self.model_cfg.use_speaker_condition and ref_mask is not None:
+                    has_speaker_duration = ref_mask.any(dim=1)
+                duration_features = build_duration_features(
+                    normalized_texts,
+                    token_counts=text_mask.sum(dim=1),
+                    max_text_len=text_max_len,
+                    has_speaker=has_speaker_duration,
+                ).to(self.model_device)
+                (
+                    duration_text_state,
+                    duration_text_mask,
+                    duration_speaker_state,
+                    duration_speaker_mask,
+                    _duration_caption_state,
+                    _duration_caption_mask,
+                ) = self.model.encode_conditions(
+                    text_input_ids=text_ids,
+                    text_mask=text_mask,
+                    ref_latent=ref_latent,
+                    ref_mask=ref_mask,
+                    caption_input_ids=caption_ids,
+                    caption_mask=caption_mask,
+                )
+                pred_log_frames = self.model.predict_duration_log_frames(
+                    text_state=duration_text_state,
+                    text_mask=duration_text_mask,
+                    speaker_state=duration_speaker_state,
+                    speaker_mask=duration_speaker_mask,
+                    duration_features=duration_features,
+                    has_speaker=has_speaker_duration,
+                )
+                predicted_frames = torch.expm1(pred_log_frames).float().reshape(-1)
+                min_frames = max(
+                    1, math.ceil(min_seconds * self.codec.sample_rate / hop_length)
+                )
+                max_frames = max(
+                    1, math.floor(max_seconds * self.codec.sample_rate / hop_length)
+                )
+                latent_steps_per_item = [
+                    max(
+                        min_frames,
+                        min(max_frames, int(round(float(frames.item()) * duration_scale))),
+                    )
+                    for frames in predicted_frames
+                ]
+                target_samples_per_item = [
+                    latent_steps * hop_length for latent_steps in latent_steps_per_item
+                ]
+                stage_sec = _measure_end(self.model_device, t0)
+                stage_timings.append(("predict_duration", stage_sec))
+                _log(
+                    "[runtime] batch predict_duration: "
+                    f"{stage_sec * 1000.0:.1f} ms frames={latent_steps_per_item}"
+                )
+            else:
+                fallback_seconds = 30.0
+                target_samples_per_item = [
+                    int(fallback_seconds * self.codec.sample_rate) for _item in reqs
+                ]
+                latent_steps_per_item = [
+                    math.ceil(target_samples / hop_length)
+                    for target_samples in target_samples_per_item
+                ]
+                msg = "info: checkpoint has no duration predictor; falling back to 30.000s."
+                messages.append(msg)
+                _log(msg)
+
+            max_latent_steps = max(latent_steps_per_item)
+            patched_steps = math.ceil(max_latent_steps / self.model_cfg.latent_patch_size)
+
+            if isinstance(self.train_cfg, dict):
+                fixed_steps = self.train_cfg.get("fixed_target_latent_steps")
+                if (
+                    isinstance(fixed_steps, int)
+                    and fixed_steps > 0
+                    and max_latent_steps > fixed_steps
+                ):
+                    msg = (
+                        f"warning: requested latent length ({max_latent_steps}) exceeds "
+                        f"fixed_target_latent_steps ({fixed_steps}) used in training. "
+                        "Long-tail stability may degrade."
+                    )
+                    messages.append(msg)
+                    _log(msg)
 
             t0 = _measure_start(self.model_device)
             z_patched = sample_euler_rf_cfg(
@@ -1735,7 +1867,7 @@ class InferenceRuntime:
             stage_sec = _measure_end(self.model_device, t0)
             stage_timings.append(("unpatchify_latent", stage_sec))
             _log(f"[runtime] batch unpatchify_latent: {stage_sec * 1000.0:.1f} ms")
-            z = z[:, :latent_steps]
+            z = z[:, :max_latent_steps]
 
             t0 = _measure_start(self.model_device, self.codec_device)
             trimmed_audios: list[torch.Tensor] = []
@@ -1743,10 +1875,11 @@ class InferenceRuntime:
                 audio_batch = self.codec.decode_latent(z).cpu()
                 for i in range(batch_size):
                     audio_i = audio_batch[i]
-                    max_samples = target_samples
+                    latent_steps = latent_steps_per_item[i]
+                    max_samples = target_samples_per_item[i]
                     if bool(req.trim_tail):
                         flattening_point = find_flattening_point(
-                            z[i],
+                            z[i, :latent_steps],
                             window_size=max(1, int(req.tail_window_size)),
                             std_threshold=float(req.tail_std_threshold),
                             mean_threshold=float(req.tail_mean_threshold),
@@ -1759,11 +1892,14 @@ class InferenceRuntime:
                     trimmed_audios.append(audio_i[:, :max_samples])
             else:
                 for i in range(batch_size):
-                    audio_i = self.codec.decode_latent(z[i : i + 1]).cpu()[0]
-                    max_samples = target_samples
+                    latent_steps = latent_steps_per_item[i]
+                    audio_i = self.codec.decode_latent(
+                        z[i : i + 1, :latent_steps]
+                    ).cpu()[0]
+                    max_samples = target_samples_per_item[i]
                     if bool(req.trim_tail):
                         flattening_point = find_flattening_point(
-                            z[i],
+                            z[i, :latent_steps],
                             window_size=max(1, int(req.tail_window_size)),
                             std_threshold=float(req.tail_std_threshold),
                             mean_threshold=float(req.tail_mean_threshold),

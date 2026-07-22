@@ -12,7 +12,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from io import BytesIO
 from pathlib import Path
@@ -28,8 +28,13 @@ from irodori_tts.inference_runtime import (
     InferenceRuntime,
     RuntimeKey,
     SamplingRequest,
+    SamplingResult,
 )
 from irodori_tts.lora import is_lora_adapter_dir
+from irodori_tts.microbatch import (
+    MicrobatchExecutor,
+    MicrobatchResult,
+)
 
 DEFAULT_CHECKPOINT = "outputs/kohaku_lora/kohaku_lora_merged.safetensors"
 DEFAULT_REF_WAV = r"D:\sbv2\Style-Bert-VITS2\Data\kohaku-haishin_v2\raw\haishin\kohaku-haishin-2.wav"
@@ -846,6 +851,31 @@ def _chunk_batch_size() -> int:
     return max(1, value)
 
 
+def _stream_microbatch_enabled() -> bool:
+    return _env_bool("IRODORI_STREAM_MICROBATCH_ENABLED", False)
+
+
+def _stream_microbatch_max_chunks() -> int:
+    return _env_int("IRODORI_STREAM_MICROBATCH_MAX_CHUNKS", 8, minimum=1)
+
+
+def _stream_microbatch_window_ms() -> float:
+    return _env_float("IRODORI_STREAM_MICROBATCH_WINDOW_MS", 30.0, minimum=0.0)
+
+
+def _stream_microbatch_queue_max_chunks() -> int:
+    return _env_int("IRODORI_STREAM_MICROBATCH_QUEUE_MAX_CHUNKS", 64, minimum=1)
+
+
+def _stream_microbatch_result_timeout_seconds() -> float:
+    default = _max_request_seconds() or 180.0
+    return _env_float(
+        "IRODORI_STREAM_MICROBATCH_RESULT_TIMEOUT_SECONDS",
+        default,
+        minimum=1.0,
+    )
+
+
 def _preview_chunk(chunk: str, max_chars: int = 80) -> str:
     normalized = " ".join(str(chunk).split())
     if len(normalized) <= max_chars:
@@ -948,6 +978,7 @@ def _iter_mp3_stream(
     chunk_seconds: list[float | None],
     *,
     release_synthesis_lock: bool = False,
+    use_microbatch: bool = False,
 ) -> Iterator[bytes]:
     request_started_at = time.perf_counter()
     output_queue: queue.Queue[bytes | object] = queue.Queue(
@@ -998,16 +1029,29 @@ def _iter_mp3_stream(
         proc: subprocess.Popen[bytes] | None = None
         reader: threading.Thread | None = None
         try:
-            with _release_synthesis_lock_on_exit(release_synthesis_lock):
-                with _track_synthesis_request(
+            lock_context = (
+                nullcontext()
+                if use_microbatch
+                else _release_synthesis_lock_on_exit(release_synthesis_lock)
+            )
+            request_context = (
+                nullcontext()
+                if use_microbatch
+                else _track_synthesis_request(
                     route="tts:stream",
                     model_id=spec.id,
                     text_chars=len(req.text),
                     chunk_count=len(chunks),
-                ):
-                    _update_active_request(phase="loading_runtime")
-                    runtime, reloaded = RUNTIME_CACHE.get(key)
-                    _ensure_lora_adapter_for_request(runtime, spec, key)
+                )
+            )
+            with lock_context:
+                with request_context:
+                    runtime: InferenceRuntime | None = None
+                    reloaded = False
+                    if not use_microbatch:
+                        _update_active_request(phase="loading_runtime")
+                        runtime, reloaded = RUNTIME_CACHE.get(key)
+                        _ensure_lora_adapter_for_request(runtime, spec, key)
 
                     LOGGER.info(
                         "[tts:stream] split model_id=%s mode=%s auto_split=%s chunks=%d max_chunk_chars=%d",
@@ -1049,36 +1093,59 @@ def _iter_mp3_stream(
                             "random" if chunk_seed is None else chunk_seed,
                             _preview_chunk(chunk),
                         )
-                        result = runtime.synthesize(
-                            SamplingRequest(
-                                text=chunk,
-                                ref_wav=ref_wav,
-                                ref_latent=ref_latent,
-                                no_ref=False,
-                                ref_normalize_db=-16.0,
-                                ref_ensure_max=True,
-                                num_candidates=1,
-                                decode_mode="sequential",
-                                seconds=seconds,
-                                duration_scale=req.duration_scale,
-                                min_seconds=req.min_seconds,
-                                max_seconds=req.max_seconds,
-                                max_ref_seconds=30.0,
-                                max_text_len=None,
-                                num_steps=req.num_steps,
-                                t_schedule_mode=req.t_schedule_mode,
-                                sway_coeff=req.sway_coeff,
-                                seed=chunk_seed,
-                                cfg_guidance_mode="independent",
-                                cfg_scale_text=req.cfg_scale_text,
-                                cfg_scale_speaker=req.cfg_scale_speaker,
-                                speaker_kv_scale=req.speaker_kv_scale,
-                                speaker_kv_min_t=req.speaker_kv_min_t,
-                                speaker_kv_max_layers=req.speaker_kv_max_layers,
-                                trim_tail=req.trim_tail,
-                                lora_adapter=_sampling_request_lora_adapter(spec, key),
-                            )
+                        sampling_request = SamplingRequest(
+                            text=chunk,
+                            ref_wav=ref_wav,
+                            ref_latent=ref_latent,
+                            no_ref=False,
+                            ref_normalize_db=-16.0,
+                            ref_ensure_max=True,
+                            num_candidates=1,
+                            decode_mode="batch" if use_microbatch else "sequential",
+                            seconds=seconds,
+                            duration_scale=req.duration_scale,
+                            min_seconds=req.min_seconds,
+                            max_seconds=req.max_seconds,
+                            max_ref_seconds=30.0,
+                            max_text_len=None,
+                            num_steps=req.num_steps,
+                            t_schedule_mode=req.t_schedule_mode,
+                            sway_coeff=req.sway_coeff,
+                            seed=chunk_seed,
+                            cfg_guidance_mode="independent",
+                            cfg_scale_text=req.cfg_scale_text,
+                            cfg_scale_speaker=req.cfg_scale_speaker,
+                            speaker_kv_scale=req.speaker_kv_scale,
+                            speaker_kv_min_t=req.speaker_kv_min_t,
+                            speaker_kv_max_layers=req.speaker_kv_max_layers,
+                            trim_tail=req.trim_tail,
+                            lora_adapter=_sampling_request_lora_adapter(spec, key),
                         )
+                        if use_microbatch:
+                            microbatch_result = _submit_stream_microbatch(
+                                _StreamMicrobatchPayload(
+                                    spec=spec,
+                                    key=key,
+                                    request=sampling_request,
+                                )
+                            )
+                            result = microbatch_result.value.result
+                            reloaded = (
+                                reloaded or microbatch_result.value.runtime_reloaded
+                            )
+                            LOGGER.info(
+                                "[tts:stream] microbatch_assigned model_id=%s chunk=%d/%d "
+                                "batch_size=%d queue_ms=%.1f batch_ms=%.1f",
+                                spec.id,
+                                index,
+                                len(chunks),
+                                microbatch_result.batch_size,
+                                microbatch_result.queue_wait_seconds * 1000.0,
+                                microbatch_result.batch_seconds * 1000.0,
+                            )
+                        else:
+                            assert runtime is not None
+                            result = runtime.synthesize(sampling_request)
                         if stop_event.is_set():
                             LOGGER.warning(
                                 "[tts:stream] cancelled_after_synthesize model_id=%s chunk=%d/%d",
@@ -1134,11 +1201,13 @@ def _iter_mp3_stream(
                     if return_code != 0:
                         raise RuntimeError(stderr.decode("utf-8", errors="replace"))
                     LOGGER.info(
-                        "[tts:stream] complete model_id=%s chunks=%d seeds=%s reloaded=%s generation_sec=%.1f",
+                        "[tts:stream] complete model_id=%s chunks=%d seeds=%s reloaded=%s "
+                        "microbatch=%s generation_sec=%.1f",
                         spec.id,
                         len(chunks),
                         ",".join(str(seed) for seed in used_seeds),
                         reloaded,
+                        use_microbatch,
                         time.perf_counter() - request_started_at,
                     )
         except Exception:
@@ -1219,6 +1288,120 @@ def _ensure_lora_adapter_for_request(
         )
 
 
+@dataclass(frozen=True)
+class _StreamMicrobatchPayload:
+    spec: ModelSpec
+    key: RuntimeKey
+    request: SamplingRequest
+
+
+@dataclass(frozen=True)
+class _StreamMicrobatchOutput:
+    result: SamplingResult
+    runtime_reloaded: bool
+
+
+_STREAM_MICROBATCH_COMMON_FIELDS = (
+    "no_ref",
+    "ref_normalize_db",
+    "ref_ensure_max",
+    "decode_mode",
+    "seconds",
+    "duration_scale",
+    "min_seconds",
+    "max_seconds",
+    "max_ref_seconds",
+    "max_text_len",
+    "max_caption_len",
+    "num_steps",
+    "cfg_scale_text",
+    "cfg_scale_caption",
+    "cfg_scale_speaker",
+    "cfg_guidance_mode",
+    "cfg_scale",
+    "cfg_min_t",
+    "cfg_max_t",
+    "truncation_factor",
+    "rescale_k",
+    "rescale_sigma",
+    "context_kv_cache",
+    "speaker_kv_scale",
+    "speaker_kv_min_t",
+    "speaker_kv_max_layers",
+    "t_schedule_mode",
+    "sway_coeff",
+    "trim_tail",
+    "tail_window_size",
+    "tail_std_threshold",
+    "tail_mean_threshold",
+    "lora_adapter",
+)
+
+
+def _stream_microbatch_group_key(payload: _StreamMicrobatchPayload) -> tuple[Any, ...]:
+    request = payload.request
+    lora_model_id = payload.spec.id if payload.key.lora_load_mode != "none" else None
+    return (
+        payload.key,
+        lora_model_id,
+        *(getattr(request, field) for field in _STREAM_MICROBATCH_COMMON_FIELDS),
+    )
+
+
+def _execute_stream_microbatch(
+    payloads: list[_StreamMicrobatchPayload],
+) -> list[_StreamMicrobatchOutput]:
+    if not payloads:
+        return []
+    first = payloads[0]
+    started_at = time.perf_counter()
+    max_seconds = _max_request_seconds()
+    watchdog: threading.Timer | None = None
+    if max_seconds > 0:
+
+        def kill_overdue_batch() -> None:
+            LOGGER.critical(
+                "[tts:microbatch] watchdog_exit max_seconds=%.1f batch_size=%d worker_id=%s",
+                max_seconds,
+                len(payloads),
+                _worker_id(),
+            )
+            logging.shutdown()
+            os._exit(_env_int("IRODORI_MAX_REQUEST_EXIT_CODE", 124, minimum=1))
+
+        watchdog = threading.Timer(max_seconds, kill_overdue_batch)
+        watchdog.daemon = True
+        watchdog.start()
+    try:
+        runtime, reloaded = RUNTIME_CACHE.get(first.key)
+        _ensure_lora_adapter_for_request(runtime, first.spec, first.key)
+        LOGGER.info(
+            "[tts:microbatch] execute size=%d models=%s chars=%s worker_id=%s",
+            len(payloads),
+            ",".join(payload.spec.id for payload in payloads),
+            ",".join(str(len(payload.request.text)) for payload in payloads),
+            _worker_id(),
+        )
+        results = runtime.synthesize_batch(
+            [payload.request for payload in payloads],
+            log_fn=LOGGER.info,
+        )
+        LOGGER.info(
+            "[tts:microbatch] complete size=%d elapsed_sec=%.3f reloaded=%s worker_id=%s",
+            len(payloads),
+            time.perf_counter() - started_at,
+            reloaded,
+            _worker_id(),
+        )
+        return [
+            _StreamMicrobatchOutput(result=result, runtime_reloaded=reloaded)
+            for result in results
+        ]
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
+
+
 def _validate_model_assets(spec: ModelSpec, *, use_lora: bool = False) -> None:
     if not Path(spec.checkpoint).is_file():
         raise HTTPException(status_code=503, detail=f"Checkpoint not found: {spec.checkpoint}")
@@ -1247,10 +1430,60 @@ _synthesis_lock = threading.Lock()
 _active_request_lock = threading.Lock()
 _active_request: dict[str, Any] | None = None
 _active_request_seq = 0
+_stream_microbatcher_lock = threading.Lock()
+_stream_microbatcher: MicrobatchExecutor[
+    _StreamMicrobatchPayload, _StreamMicrobatchOutput
+] | None = None
+
+
+def _get_stream_microbatcher() -> MicrobatchExecutor[
+    _StreamMicrobatchPayload, _StreamMicrobatchOutput
+]:
+    global _stream_microbatcher
+    with _stream_microbatcher_lock:
+        if _stream_microbatcher is None:
+            _stream_microbatcher = MicrobatchExecutor(
+                _execute_stream_microbatch,
+                max_batch_size=_stream_microbatch_max_chunks(),
+                window_ms=_stream_microbatch_window_ms(),
+                max_queue_size=_stream_microbatch_queue_max_chunks(),
+                thread_name="irodori-stream-microbatch",
+            )
+            LOGGER.info(
+                "[tts:microbatch] started max_chunks=%d window_ms=%.1f queue_max=%d",
+                _stream_microbatcher.max_batch_size,
+                _stream_microbatcher.window_ms,
+                _stream_microbatch_queue_max_chunks(),
+            )
+        return _stream_microbatcher
+
+
+def _stream_microbatch_stats() -> dict[str, int | float | bool] | None:
+    with _stream_microbatcher_lock:
+        executor = _stream_microbatcher
+    if executor is None:
+        return None
+    return executor.stats()
+
+
+def _submit_stream_microbatch(
+    payload: _StreamMicrobatchPayload,
+) -> MicrobatchResult[_StreamMicrobatchOutput]:
+    executor = _get_stream_microbatcher()
+    return executor.submit(
+        _stream_microbatch_group_key(payload),
+        payload,
+        timeout=_stream_microbatch_result_timeout_seconds(),
+    )
 
 
 def _synthesis_busy() -> bool:
-    return _synthesis_lock.locked()
+    if _synthesis_lock.locked():
+        return True
+    stats = _stream_microbatch_stats()
+    if stats is None:
+        return False
+    return int(stats["pending"]) >= int(stats["max_queue_size"])
 
 
 def _worker_id() -> str | None:
@@ -1426,6 +1659,8 @@ def _readiness_payload() -> dict[str, Any]:
         "assets_ready": assets_ready,
         "busy": busy,
         "active_request": _active_request_payload(),
+        "stream_microbatch_enabled": _stream_microbatch_enabled(),
+        "stream_microbatch": _stream_microbatch_stats(),
         "worker_id": _worker_id(),
         "models": rows,
         "cache": RUNTIME_CACHE.keys(),
@@ -1479,6 +1714,8 @@ def _try_synthesis_lock(route: str, model_id: str | None) -> Iterator[None]:
 
 @app.on_event("startup")
 def preload_models() -> None:
+    if _stream_microbatch_enabled():
+        _get_stream_microbatcher()
     if not _env_bool("IRODORI_PRELOAD_MODELS", True):
         return
     for spec in REGISTRY.models.values():
@@ -1486,6 +1723,16 @@ def preload_models() -> None:
             continue
         _validate_model_assets(spec, use_lora=False)
         RUNTIME_CACHE.get(build_runtime_key(spec, use_lora=False))
+
+
+@app.on_event("shutdown")
+def shutdown_stream_microbatcher() -> None:
+    global _stream_microbatcher
+    with _stream_microbatcher_lock:
+        executor = _stream_microbatcher
+        _stream_microbatcher = None
+    if executor is not None:
+        executor.close(timeout=2.0)
 
 
 @app.get("/ping")
@@ -1507,6 +1754,8 @@ async def health() -> dict[str, Any]:
         "worker_id": _worker_id(),
         "busy": _synthesis_busy(),
         "active_request": _active_request_payload(),
+        "stream_microbatch_enabled": _stream_microbatch_enabled(),
+        "stream_microbatch": _stream_microbatch_stats(),
         "busy_wait_timeout_seconds": _busy_wait_timeout_seconds(),
         "max_request_seconds": _max_request_seconds(),
     }
@@ -1750,6 +1999,7 @@ def tts_stream(req: TTSRequest) -> StreamingResponse:
         if req.seed is None
         else ",".join(str(req.seed + index) for index in range(len(chunks)))
     )
+    microbatch_enabled = _stream_microbatch_enabled()
     headers = {
         "Cache-Control": "no-store",
         "X-Irodori-Stream-Mode": "ffmpeg-pcm-mp3",
@@ -1776,8 +2026,33 @@ def tts_stream(req: TTSRequest) -> StreamingResponse:
         "X-Irodori-Min-Seconds": str(req.min_seconds),
         "X-Irodori-Max-Seconds": str(req.max_seconds),
         "X-Irodori-Trim-Tail": "1" if req.trim_tail else "0",
+        "X-Irodori-Stream-Microbatch": "1" if microbatch_enabled else "0",
+        "X-Irodori-Stream-Microbatch-Max-Chunks": str(
+            _stream_microbatch_max_chunks() if microbatch_enabled else 1
+        ),
+        "X-Irodori-Stream-Microbatch-Window-Ms": (
+            f"{_stream_microbatch_window_ms():g}" if microbatch_enabled else "0"
+        ),
     }
     headers.update(_worker_headers())
+    if microbatch_enabled:
+        executor = _get_stream_microbatcher()
+        stats = executor.stats()
+        if int(stats["pending"]) >= int(stats["max_queue_size"]):
+            _raise_worker_busy("tts:stream:microbatch", spec.id)
+        return StreamingResponse(
+            _iter_mp3_stream(
+                spec,
+                key,
+                req,
+                chunks,
+                chunk_seconds,
+                use_microbatch=True,
+            ),
+            media_type="audio/mpeg",
+            headers=headers,
+        )
+
     _acquire_synthesis_lock("tts:stream", spec.id)
     try:
         return StreamingResponse(
