@@ -1,5 +1,11 @@
 FROM s41t0h/irodori-tts-kohaku-api:20260706-watchdog-lb
 
+# RunPod's RTX 4090 pool currently includes driver 550 hosts. The inherited
+# CUDA 12.8 image otherwise fails its OCI pre-start version constraint before
+# the application can launch. CUDA 12.x keeps minor-version compatibility;
+# runtime inference is verified separately by the benchmark.
+ENV NVIDIA_DISABLE_REQUIRE=true
+
 COPY api_server.py /app/api_server.py
 COPY irodori_tts/inference_runtime.py /app/irodori_tts/inference_runtime.py
 COPY irodori_tts/microbatch.py /app/irodori_tts/microbatch.py
