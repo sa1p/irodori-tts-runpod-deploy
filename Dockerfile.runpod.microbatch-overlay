@@ -9,8 +9,14 @@ RUN uv pip install --python /app/.venv/bin/python --reinstall \
     && uv pip install --python /app/.venv/bin/python --reinstall --no-deps \
         "torchcodec==0.2.0"
 
+ENV NVIDIA_DISABLE_REQUIRE="true"
 ENV NVIDIA_REQUIRE_CUDA="cuda>=12.4"
 
 COPY api_server.py /app/api_server.py
 COPY irodori_tts/inference_runtime.py /app/irodori_tts/inference_runtime.py
 COPY irodori_tts/microbatch.py /app/irodori_tts/microbatch.py
+COPY scripts/runpod_start_4090_lb.sh /app/scripts/runpod_start_4090_lb.sh
+
+RUN chmod +x /app/scripts/runpod_start_4090_lb.sh
+
+CMD ["/app/scripts/runpod_start_4090_lb.sh"]
