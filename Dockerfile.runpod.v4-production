@@ -1,4 +1,22 @@
-FROM s41t0h/irodori-tts-kohaku-api:20260801-readiness-watchdog-hotfix@sha256:22a0f3018ab5dff5fcc8369893e764ac514a132d120cf62403e0881accf6ede9
+FROM s41t0h/irodori-tts-kohaku-api:20260801-readiness-watchdog-hotfix@sha256:22a0f3018ab5dff5fcc8369893e764ac514a132d120cf62403e0881accf6ede9 AS v3_artifacts
+
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH="/root/.local/bin:${PATH}"
+ENV UV_LINK_MODE=copy
+ENV PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    ffmpeg \
+    git \
+    python3 \
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
 ENV HF_HOME=/opt/huggingface-cache
 ENV IRODORI_MODEL_REGISTRY=/opt/irodori_artifacts/configs/model_registry.runpod.json
@@ -16,6 +34,10 @@ RUN uv sync --frozen --no-dev --extra cu128
 COPY irodori_tts ./irodori_tts
 COPY api_server.py infer.py ./
 
+COPY --from=v3_artifacts /opt/irodori_artifacts/configs /opt/irodori_artifacts/configs
+COPY --from=v3_artifacts /opt/irodori_artifacts/ref_latents /opt/irodori_artifacts/ref_latents
+COPY --from=v3_artifacts /opt/irodori_artifacts/ref_latents_distilled /opt/irodori_artifacts/ref_latents_distilled
+
 RUN uv run --no-sync python -c "from huggingface_hub import snapshot_download; snapshot_download('Aratako/Irodori-TTS-v4-Small', local_dir='/opt/irodori_artifacts/models/Irodori-TTS-v4-Small'); snapshot_download('sbintuitions/modernbert-ja-310m'); snapshot_download('Aratako/Semantic-DACVAE-Japanese-32dim')"
 
 RUN cp /opt/irodori_artifacts/configs/model_registry.runpod.json /opt/irodori_artifacts/configs/model_registry.v3.rollback.json \
@@ -26,4 +48,8 @@ RUN cp /opt/irodori_artifacts/configs/model_registry.runpod.json /opt/irodori_ar
 LABEL org.opencontainers.image.title="Irodori-TTS v4 Small production worker"
 LABEL org.opencontainers.image.revision="8ca3acb58ab4e19ad6d594aaed6bafe3e88f7f71"
 
-CMD ["/app/scripts/runpod_start_lb.sh"]
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${PORT:-8000}/ping" || exit 1
+
+CMD ["uv", "run", "--no-sync", "uvicorn", "api_server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
