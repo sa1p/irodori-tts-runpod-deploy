@@ -1,0 +1,7 @@
+ARG BASE_IMAGE=ghcr.io/sa1p/irodori-tts-kohaku-api:v4-small-20260804-chibi-arisu
+FROM ${BASE_IMAGE}
+
+COPY build/chibi_arisu/reference.pt /opt/irodori_artifacts/ref_latents/chibi_arisu/reference.pt
+
+LABEL org.opencontainers.image.description="Irodori v4-small with chibi Arisu reference v2"
+LABEL ai.hachiroku.voice.chibi_arisu.reference="04-candidate-generated.wav"
