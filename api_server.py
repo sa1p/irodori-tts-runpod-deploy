@@ -1200,6 +1200,11 @@ def _iter_mp3_stream(
         finally:
             set_active_proc(None)
 
+    # ここに到達した = ジェネレータが実際にイテレートされ、解放責任を
+    # worker スレッドが引き受けた。ここより手前で切断されるとロックが
+    # リークするので、リーパーがそれを回収する。
+    if release_synthesis_lock:
+        _mark_synthesis_lock_started()
     worker = threading.Thread(target=generate_and_encode, daemon=True)
     worker.start()
     try:
@@ -1297,6 +1302,122 @@ _synthesis_lock = threading.Lock()
 _active_request_lock = threading.Lock()
 _active_request: dict[str, Any] | None = None
 _active_request_seq = 0
+
+# --- 合成ロックのリーク対策 ---------------------------------------------------
+# /v1/tts/stream は StreamingResponse を返す *前* にロックを取り、解放は
+# ジェネレータ内で起動する worker スレッドに委ねている。ジェネレータは
+# 一度もイテレートされなければ本体が実行されないため、クライアントが
+# レスポンス開始前に切断すると worker が起動せず、ロックが永久に残る。
+# 実際に 2026-08-07 に busy=True / active_request=None のまま全断した。
+#
+# 対策は 2 段:
+#   1. ロックを取ったら「まだ誰にも引き渡していない」印を付け、ジェネレータが
+#      実際に走り始めた時点で引き渡し済みにする（_mark_synthesis_lock_started）
+#   2. 引き渡されないまま猶予を過ぎたロックを回収するリーパースレッド
+# リーパーは他の経路でリークした場合にも効く保険として常に動かす。
+_synthesis_lock_state_lock = threading.Lock()
+_synthesis_lock_acquired_at: float | None = None
+_synthesis_lock_handed_off = False
+_synthesis_lock_owner: str | None = None
+_synthesis_lock_reaps = 0
+
+
+def _synthesis_lock_startup_grace_seconds() -> float:
+    """ロックを取ってからジェネレータが走り出すまでの猶予。"""
+    return _env_float("IRODORI_LOCK_STARTUP_GRACE_SECONDS", 15.0, minimum=1.0)
+
+
+def _synthesis_lock_max_hold_seconds() -> float:
+    """引き渡し後も含めた保持上限。0 で無効。"""
+    return _env_float("IRODORI_LOCK_MAX_HOLD_SECONDS", 600.0, minimum=0.0)
+
+
+def _note_synthesis_lock_acquired(owner: str) -> None:
+    global _synthesis_lock_acquired_at, _synthesis_lock_handed_off, _synthesis_lock_owner
+    with _synthesis_lock_state_lock:
+        _synthesis_lock_acquired_at = time.monotonic()
+        _synthesis_lock_handed_off = False
+        _synthesis_lock_owner = owner
+
+
+def _mark_synthesis_lock_started() -> None:
+    """ジェネレータ（= 解放責任を持つ側）が走り始めたことを記録する。"""
+    global _synthesis_lock_handed_off
+    with _synthesis_lock_state_lock:
+        _synthesis_lock_handed_off = True
+
+
+def _synthesis_lock_held_seconds() -> float:
+    """現在のロック保持時間。保持していなければ 0。"""
+    with _synthesis_lock_state_lock:
+        acquired_at = _synthesis_lock_acquired_at
+    if acquired_at is None:
+        return 0.0
+    return round(time.monotonic() - acquired_at, 3)
+
+
+def _note_synthesis_lock_released() -> None:
+    global _synthesis_lock_acquired_at, _synthesis_lock_handed_off, _synthesis_lock_owner
+    with _synthesis_lock_state_lock:
+        _synthesis_lock_acquired_at = None
+        _synthesis_lock_handed_off = False
+        _synthesis_lock_owner = None
+
+
+def _reap_leaked_synthesis_lock() -> str | None:
+    """リークしたロックを回収する。回収したら理由を返す。"""
+    global _synthesis_lock_reaps
+    if not _synthesis_lock.locked():
+        return None
+    with _synthesis_lock_state_lock:
+        acquired_at = _synthesis_lock_acquired_at
+        handed_off = _synthesis_lock_handed_off
+        owner = _synthesis_lock_owner
+    if acquired_at is None:
+        return None
+    held = time.monotonic() - acquired_at
+    reason: str | None = None
+    if not handed_off and held > _synthesis_lock_startup_grace_seconds():
+        reason = "generator_never_started"
+    else:
+        max_hold = _synthesis_lock_max_hold_seconds()
+        if max_hold > 0 and held > max_hold and _active_request_payload() is None:
+            reason = "held_without_active_request"
+    if reason is None:
+        return None
+    try:
+        _synthesis_lock.release()
+    except RuntimeError:
+        # 誰かが先に解放した。競合なので何もしない
+        return None
+    _note_synthesis_lock_released()
+    with _synthesis_lock_state_lock:
+        _synthesis_lock_reaps += 1
+    LOGGER.error(
+        "[tts] synthesis_lock_reaped reason=%s owner=%s held_sec=%.1f",
+        reason,
+        owner,
+        held,
+    )
+    return reason
+
+
+def _synthesis_lock_reaper_loop() -> None:
+    while True:
+        time.sleep(1.0)
+        try:
+            _reap_leaked_synthesis_lock()
+        except Exception:  # noqa: BLE001 - 監視スレッドは死なせない
+            LOGGER.exception("[tts] synthesis_lock_reaper_error")
+
+
+def _start_synthesis_lock_reaper() -> None:
+    thread = threading.Thread(
+        target=_synthesis_lock_reaper_loop,
+        name="synthesis-lock-reaper",
+        daemon=True,
+    )
+    thread.start()
 
 
 def _synthesis_busy() -> bool:
@@ -1483,6 +1604,7 @@ def _readiness_payload() -> dict[str, Any]:
 
 def _acquire_synthesis_lock(route: str, model_id: str | None) -> None:
     if _synthesis_lock.acquire(blocking=False):
+        _note_synthesis_lock_acquired(f"{route}:{model_id}")
         return
 
     wait_timeout = _busy_wait_timeout_seconds()
@@ -1499,6 +1621,7 @@ def _acquire_synthesis_lock(route: str, model_id: str | None) -> None:
     )
     if not _synthesis_lock.acquire(timeout=wait_timeout):
         _raise_worker_busy(route, model_id)
+    _note_synthesis_lock_acquired(f"{route}:{model_id}")
     LOGGER.info(
         "[tts] busy_wait_acquired route=%s model_id=%s worker_id=%s waited_sec=%.3f",
         route,
@@ -1515,6 +1638,7 @@ def _release_synthesis_lock_on_exit(enabled: bool) -> Iterator[None]:
     finally:
         if enabled:
             _synthesis_lock.release()
+            _note_synthesis_lock_released()
 
 
 @contextmanager
@@ -1524,6 +1648,7 @@ def _try_synthesis_lock(route: str, model_id: str | None) -> Iterator[None]:
         yield
     finally:
         _synthesis_lock.release()
+        _note_synthesis_lock_released()
 
 
 def _warmup_seconds() -> list[float]:
@@ -1575,6 +1700,15 @@ def _warmup_runtime(spec: ModelSpec, runtime: InferenceRuntime) -> None:
 
 
 @app.on_event("startup")
+def start_synthesis_lock_reaper() -> None:
+    """リークした合成ロックの回収スレッドを立てる。
+
+    IRODORI_PRELOAD_MODELS の設定に関係なく必ず起動する。
+    """
+    _start_synthesis_lock_reaper()
+
+
+@app.on_event("startup")
 def preload_models() -> None:
     if not _env_bool("IRODORI_PRELOAD_MODELS", True):
         return
@@ -1607,6 +1741,10 @@ async def health() -> dict[str, Any]:
         "active_request": _active_request_payload(),
         "busy_wait_timeout_seconds": _busy_wait_timeout_seconds(),
         "max_request_seconds": _max_request_seconds(),
+        # リーク回収が起きたら外形監視から気づけるようにする。
+        # 増え続けるならストリーム経路の解放がまだ漏れている。
+        "synthesis_lock_reaps": _synthesis_lock_reaps,
+        "synthesis_lock_held_seconds": _synthesis_lock_held_seconds(),
     }
 
 
@@ -1894,4 +2032,5 @@ def tts_stream(req: TTSRequest) -> StreamingResponse:
         )
     except Exception:
         _synthesis_lock.release()
+        _note_synthesis_lock_released()
         raise
