@@ -1,0 +1,18 @@
+# 本番イメージに、合成ロックのリーク修正だけを重ねるオーバーレイ。
+#
+# 本番イメージ (v4-small-20260806-chibi-arisu-ref-v2) は
+#   v4-small-20260802 → -20260804-chibi-arisu (registry に chibi_arisu 追加)
+#   → -20260806-chibi-arisu-ref-v2 (reference.pt 差し替え)
+# という積み重ねでできており、モデルは 45 件ある。
+#
+# Dockerfile.runpod.v4-production から作り直すと ref_latents を
+# 別のベースイメージ (20260801-readiness-watchdog-hotfix) から取るため
+# chibi_arisu が落ちて 44 件になる（2026-08-08 に実際に踏んだ）。
+#
+# そのため本番イメージをベースにして api_server.py だけ差し替える。
+ARG BASE_IMAGE=ghcr.io/sa1p/irodori-tts-kohaku-api:v4-small-20260806-chibi-arisu-ref-v2
+FROM ${BASE_IMAGE}
+
+COPY api_server.py /app/api_server.py
+
+LABEL org.opencontainers.image.description="Irodori v4-small (chibi Arisu ref v2) + synthesis lock leak fix"
