@@ -65,6 +65,10 @@ class TTSRequest(BaseModel):
     text: str = Field(..., min_length=1)
     caption: str | None = Field(default=None, max_length=1000)
     model_id: str | None = None
+    # model_id は checkpoint / runtime を選ぶために常に必要。
+    # no_ref=True のときだけ、registry に紐づく ref_wav / ref_latent を使わず、
+    # caption だけで新しい話者を設計する。
+    no_ref: bool = False
     format: Literal["wav", "mp3"] = "wav"
     auto_split: bool = True
     max_chunk_chars: int = Field(default=100, ge=20, le=100)
@@ -828,6 +832,8 @@ def _decode_reference_wav_base64(raw: str, mime: str | None) -> str:
 
 
 def _resolve_reference_inputs(spec: ModelSpec, req: TTSRequest) -> tuple[str | None, str | None]:
+    if req.no_ref:
+        return None, None
     if req.reference_latent:
         return None, req.reference_latent
     if req.reference_wav_base64:
@@ -1099,7 +1105,7 @@ def _iter_mp3_stream(
                                 caption=req.caption,
                                 ref_wav=ref_wav,
                                 ref_latent=ref_latent,
-                                no_ref=False,
+                                no_ref=req.no_ref,
                                 ref_normalize_db=-16.0,
                                 ref_ensure_max=True,
                                 num_candidates=1,
@@ -1858,7 +1864,7 @@ def tts(req: TTSRequest) -> Response:
                                 caption=req.caption,
                                 ref_wav=ref_wav,
                                 ref_latent=ref_latent,
-                                no_ref=False,
+                                no_ref=req.no_ref,
                                 ref_normalize_db=-16.0,
                                 ref_ensure_max=True,
                                 num_candidates=1,
@@ -1937,7 +1943,10 @@ def tts(req: TTSRequest) -> Response:
         "X-Irodori-Num-Steps": str(_resolve_num_steps(req)),
         "X-Irodori-T-Schedule-Mode": req.t_schedule_mode,
         "X-Irodori-Sway-Coeff": str(req.sway_coeff),
+        "X-Irodori-Cfg-Scale-Text": str(req.cfg_scale_text),
+        "X-Irodori-Cfg-Scale-Caption": str(req.cfg_scale_caption),
         "X-Irodori-Cfg-Scale-Speaker": str(req.cfg_scale_speaker),
+        "X-Irodori-No-Ref": "1" if req.no_ref else "0",
         "X-Irodori-Speaker-Kv-Scale": "" if req.speaker_kv_scale is None else str(req.speaker_kv_scale),
         "X-Irodori-Speaker-Kv-Min-T": "" if req.speaker_kv_min_t is None else str(req.speaker_kv_min_t),
         "X-Irodori-Speaker-Kv-Max-Layers": ""
@@ -2000,7 +2009,10 @@ def tts_stream(req: TTSRequest) -> StreamingResponse:
         "X-Irodori-Num-Steps": str(_resolve_num_steps(req)),
         "X-Irodori-T-Schedule-Mode": req.t_schedule_mode,
         "X-Irodori-Sway-Coeff": str(req.sway_coeff),
+        "X-Irodori-Cfg-Scale-Text": str(req.cfg_scale_text),
+        "X-Irodori-Cfg-Scale-Caption": str(req.cfg_scale_caption),
         "X-Irodori-Cfg-Scale-Speaker": str(req.cfg_scale_speaker),
+        "X-Irodori-No-Ref": "1" if req.no_ref else "0",
         "X-Irodori-Speaker-Kv-Scale": "" if req.speaker_kv_scale is None else str(req.speaker_kv_scale),
         "X-Irodori-Speaker-Kv-Min-T": "" if req.speaker_kv_min_t is None else str(req.speaker_kv_min_t),
         "X-Irodori-Speaker-Kv-Max-Layers": ""
