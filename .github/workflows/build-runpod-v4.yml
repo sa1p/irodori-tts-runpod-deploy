@@ -1,8 +1,7 @@
 name: Build RunPod Irodori v4 image
 
-# このブランチでは本番イメージへのオーバーレイをビルドする。
-# フルビルドだと ref_latents を別ベースから取り直して chibi_arisu が落ちるため
-# (2026-08-08 に 45 -> 44 件になった)。詳細は Dockerfile.runpod.lockfix-overlay。
+# このブランチでは現在の本番イメージを維持したまま、チェックポイントだけを
+# Irodori-TTS-v4.1-Smallへ更新する。
 
 on:
   workflow_dispatch:
@@ -10,11 +9,15 @@ on:
       image_tag:
         description: GHCR image tag
         required: true
-        default: v4-small-20260808-lockfix-overlay
+        default: v4.1-small-20260819
       base_image:
-        description: Base image to overlay on
+        description: Current production image to overlay on
         required: true
-        default: ghcr.io/sa1p/irodori-tts-kohaku-api:v4-small-20260806-chibi-arisu-ref-v2
+        default: ghcr.io/sa1p/irodori-tts-kohaku-api:v4-small-20260808-lockfix-overlay
+      checkpoint_revision:
+        description: Irodori-TTS-v4.1-Small revision
+        required: true
+        default: 2b28324dc263ed5e6638b3cf3dd94c82ead07b4b
 
 permissions:
   contents: read
@@ -42,9 +45,10 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: Dockerfile.runpod.lockfix-overlay
+          file: Dockerfile.runpod.v4.1-checkpoint-overlay
           build-args: |
             BASE_IMAGE=${{ inputs.base_image }}
+            IRODORI_V41_REVISION=${{ inputs.checkpoint_revision }}
           platforms: linux/amd64
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/irodori-tts-kohaku-api:${{ inputs.image_tag }}
