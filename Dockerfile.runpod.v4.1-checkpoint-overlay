@@ -1,0 +1,15 @@
+# 現在の本番イメージを維持したまま、Irodori-TTS のチェックポイントだけを
+# v4-Small から v4.1-Small に更新する。
+ARG BASE_IMAGE=ghcr.io/sa1p/irodori-tts-kohaku-api:v4-small-20260808-lockfix-overlay
+FROM ${BASE_IMAGE}
+
+ARG IRODORI_V41_REVISION=2b28324dc263ed5e6638b3cf3dd94c82ead07b4b
+
+RUN uv run --no-sync python -c "from huggingface_hub import snapshot_download; snapshot_download('Aratako/Irodori-TTS-v4.1-Small', revision='${IRODORI_V41_REVISION}', local_dir='/opt/irodori_artifacts/models/Irodori-TTS-v4.1-Small')" \
+    && uv run --no-sync python -c "from pathlib import Path; p=Path('/opt/irodori_artifacts/configs/model_registry.runpod.json'); s=p.read_text(encoding='utf-8'); old='/models/Irodori-TTS-v4-Small/model.safetensors'; new='/models/Irodori-TTS-v4.1-Small/model.safetensors'; count=s.count(old); assert count > 0, f'v4 checkpoint path not found: {p}'; p.with_name('model_registry.v4.rollback.json').write_text(s, encoding='utf-8'); p.write_text(s.replace(old, new), encoding='utf-8'); assert p.read_text(encoding='utf-8').count(new) == count" \
+    && rm -rf /opt/irodori_artifacts/models/Irodori-TTS-v4-Small
+
+LABEL org.opencontainers.image.title="Irodori-TTS v4.1 Small production worker"
+LABEL org.opencontainers.image.description="Production v4 runtime with the improved v4.1 duration predictor"
+LABEL org.opencontainers.image.version="v4.1-small"
+LABEL org.opencontainers.image.irodori-checkpoint="Aratako/Irodori-TTS-v4.1-Small@2b28324dc263ed5e6638b3cf3dd94c82ead07b4b"
