@@ -1,0 +1,10 @@
+ARG BASE_IMAGE=ghcr.io/sa1p/irodori-tts-kohaku-api:v4-small-20260808-lockfix-overlay
+FROM ${BASE_IMAGE}
+
+# 既存の依存と旧チェックポイントを保持し、Anime版だけ追加する。
+ARG ANIME_REVISION=6b259f5baa5e236b3d14cbd1f8555ca87d92b530
+COPY api_server.py /app/api_server.py
+RUN uv run --no-sync python -c "from huggingface_hub import snapshot_download; snapshot_download('phasefield-audio/Irodori-TTS-v4.1-Anime', revision='${ANIME_REVISION}', allow_patterns=['model.safetensors','tokenizer/*'], local_dir='/opt/irodori_artifacts/models/Irodori-TTS-v4.1-Anime')" \
+    && uv run --no-sync python -c "import hashlib,json; from pathlib import Path; root=Path('/opt/irodori_artifacts'); w=root/'models/Irodori-TTS-v4.1-Anime/model.safetensors'; h=hashlib.sha256(); f=w.open('rb'); [h.update(b) for b in iter(lambda:f.read(8388608),b'')]; f.close(); assert h.hexdigest() == '5630aa0a661930ff678a1d1f1893876e24520f4776d4fcc25ca54e6ab9f41f37'; p=root/'configs/model_registry.runpod.json'; original=p.read_text(); data=json.loads(original); assert data['models']; p.with_name('model_registry.before-anime.json').write_text(original); [(m.update(checkpoint=str(w))) for m in data['models']]; p.write_text(json.dumps(data,ensure_ascii=False,indent=2))"
+
+LABEL org.opencontainers.image.irodori-checkpoint="phasefield-audio/Irodori-TTS-v4.1-Anime@6b259f5baa5e236b3d14cbd1f8555ca87d92b530"

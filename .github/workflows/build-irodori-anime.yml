@@ -1,0 +1,32 @@
+name: Build Irodori v4.1 Anime overlay
+on:
+  push:
+    branches: [codex/v41-anime-20260908]
+    paths:
+      - Dockerfile.runpod.v4.1-anime-overlay
+      - .github/workflows/build-irodori-anime.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.runpod.v4.1-anime-overlay
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/sa1p/irodori-tts-kohaku-api:v4.1-anime-20260908
+          provenance: false
+          sbom: false
